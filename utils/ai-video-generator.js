@@ -1010,24 +1010,51 @@ class AIVideoGenerator {
     return slides;
   }
 
+  /**
+   * Render a section's own words onto its slide.
+   *
+   * Array-shaped `content` — what the AI writer produces — was not handled, so
+   * every AI-written script fell through to a hardcoded English placeholder
+   * ("Content coming soon..."), burned into the frames of an otherwise French
+   * video. There is now no English fallback at all: with nothing to show, the
+   * slide keeps just its title.
+   */
   formatSectionContent(section) {
-    if (section.items && Array.isArray(section.items)) {
-      return section.items.slice(0, 3).map(item => 
-        `<p>${item.number}. ${item.title}</p>`
-      ).join('');
+    const escape = text => String(text)
+      .replace(/&/g, '&amp;')
+      .replace(/</g, '&lt;')
+      .replace(/>/g, '&gt;');
+
+    const paragraph = (text, limit = 200) => {
+      const clean = String(text).trim();
+      if (!clean) return '';
+      const truncated = clean.length > limit ? `${clean.slice(0, limit).trimEnd()}…` : clean;
+      return `<p>${escape(truncated)}</p>`;
+    };
+
+    if (Array.isArray(section.content) && section.content.length) {
+      return section.content.slice(0, 3).map(line => paragraph(line, 180)).join('');
     }
-    
-    if (section.steps && Array.isArray(section.steps)) {
-      return section.steps.slice(0, 3).map(step => 
-        `<p>${step.title}</p>`
-      ).join('');
+
+    if (Array.isArray(section.items) && section.items.length) {
+      return section.items.slice(0, 3)
+        .map(item => paragraph(`${item.number ? `${item.number}. ` : ''}${item.title || ''}`))
+        .join('');
     }
-    
+
+    if (Array.isArray(section.steps) && section.steps.length) {
+      return section.steps.slice(0, 3).map(step => paragraph(step.title)).join('');
+    }
+
+    if (Array.isArray(section.points) && section.points.length) {
+      return section.points.slice(0, 3).map(point => paragraph(point)).join('');
+    }
+
     if (typeof section.content === 'string') {
-      return `<p>${section.content.slice(0, 200)}${section.content.length > 200 ? '...' : ''}</p>`;
+      return paragraph(section.content);
     }
-    
-    return '<p>Content coming soon...</p>';
+
+    return '';
   }
 
   /**

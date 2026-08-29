@@ -3829,6 +3829,30 @@ class SystemTest {
         throw new Error(`${slides} slides render ${rendered.toFixed(2)}s for a ${target}s target`);
       }
     }
+
+    // 3. Slide text is burned into the frames, so it must be the section's own
+    // words — never an English placeholder in a French video.
+    const arraySection = {
+      title: 'Déclarer un sinistre',
+      content: ['Connectez-vous à l\'espace personnel de votre banque.', 'Ouvrez la rubrique Assurances.'],
+    };
+    const rendered = generator.formatSectionContent(arraySection);
+    if (!rendered.includes('espace personnel de votre banque')) {
+      throw new Error(`Array-shaped section content was not rendered onto the slide: ${rendered}`);
+    }
+    if (/coming soon/i.test(rendered)) {
+      throw new Error('English placeholder text is still reachable');
+    }
+    // With nothing to show, the slide keeps its title rather than English filler.
+    const empty = generator.formatSectionContent({ title: 'Sans contenu' });
+    if (empty !== '') {
+      throw new Error(`An empty section produced filler text: ${empty}`);
+    }
+    // Markup in the script must not break the slide HTML.
+    const escaped = generator.formatSectionContent({ content: ['<script>alert(1)</script> & co'] });
+    if (escaped.includes('<script>')) {
+      throw new Error('Slide content is not HTML-escaped');
+    }
   }
 }
 
