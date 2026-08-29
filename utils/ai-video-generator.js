@@ -1032,26 +1032,29 @@ class AIVideoGenerator {
       return `<p>${escape(truncated)}</p>`;
     };
 
+    // One short line only. The narrator is already speaking this text, and the
+    // slide's background is a screenshot of the interface being explained —
+    // stacking full paragraphs on top of it hid the very thing the viewer needs
+    // to see.
     if (Array.isArray(section.content) && section.content.length) {
-      return section.content.slice(0, 3).map(line => paragraph(line, 180)).join('');
+      return paragraph(section.content[0], 120);
     }
 
     if (Array.isArray(section.items) && section.items.length) {
-      return section.items.slice(0, 3)
-        .map(item => paragraph(`${item.number ? `${item.number}. ` : ''}${item.title || ''}`))
-        .join('');
+      const item = section.items[0];
+      return paragraph(`${item.number ? `${item.number}. ` : ''}${item.title || ''}`, 120);
     }
 
     if (Array.isArray(section.steps) && section.steps.length) {
-      return section.steps.slice(0, 3).map(step => paragraph(step.title)).join('');
+      return paragraph(section.steps[0].title, 120);
     }
 
     if (Array.isArray(section.points) && section.points.length) {
-      return section.points.slice(0, 3).map(point => paragraph(point)).join('');
+      return paragraph(section.points[0], 120);
     }
 
     if (typeof section.content === 'string') {
-      return paragraph(section.content);
+      return paragraph(section.content, 120);
     }
 
     return '';
