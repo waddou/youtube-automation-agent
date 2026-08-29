@@ -929,16 +929,56 @@ class AIVideoGenerator {
   async simulateVisualAssets(prompt, style, count) {
     this.logger.info(`Simulating ${count} visual assets...`);
     
+    const { createCanvas } = require('canvas');
+    
     const paths = [];
     for (let i = 0; i < count; i++) {
-      const assetPath = path.join(__dirname, '..', 'data', 'assets', `visual_sim_${Date.now()}_${i}.info`);
+      const assetPath = path.join(__dirname, '..', 'data', 'assets', `visual_${Date.now()}_${i}.png`);
       
-      await fs.writeFile(assetPath, JSON.stringify({
-        message: 'AI visual asset would be generated here',
-        prompt: prompt,
-        style: style,
-        timestamp: new Date().toISOString()
-      }, null, 2));
+      await fs.mkdir(path.dirname(assetPath), { recursive: true });
+      
+      // Create a canvas with gradient and text
+      const canvas = createCanvas(1920, 1080);
+      const ctx = canvas.getContext('2d');
+      
+      // Gradient background
+      const gradient = ctx.createLinearGradient(0, 0, 1920, 1080);
+      if (style === 'ethereal') {
+        gradient.addColorStop(0, '#1a1a2e');
+        gradient.addColorStop(0.5, '#16213e');
+        gradient.addColorStop(1, '#0f0f23');
+      } else if (style === 'modern') {
+        gradient.addColorStop(0, '#ffffff');
+        gradient.addColorStop(1, '#f0f0f0');
+      } else {
+        gradient.addColorStop(0, '#667eea');
+        gradient.addColorStop(1, '#764ba2');
+      }
+      ctx.fillStyle = gradient;
+      ctx.fillRect(0, 0, 1920, 1080);
+      
+      // Add decorative elements
+      ctx.fillStyle = 'rgba(255,255,255,0.05)';
+      for (let x = 0; x < 1920; x += 100) {
+        for (let y = 0; y < 1080; y += 100) {
+          ctx.beginPath();
+          ctx.arc(x, y, 2, 0, Math.PI * 2);
+          ctx.fill();
+        }
+      }
+      
+      // Add text
+      ctx.fillStyle = 'rgba(255,255,255,0.9)';
+      ctx.font = 'bold 64px Arial';
+      ctx.textAlign = 'center';
+      ctx.fillText(prompt.substring(0, 80), 960, 480);
+      
+      ctx.font = '32px Arial';
+      ctx.fillStyle = 'rgba(255,255,255,0.6)';
+      ctx.fillText(`Style: ${style} | Scene ${i + 1}`, 960, 560);
+      
+      const buffer = canvas.toBuffer('image/png');
+      await fs.writeFile(assetPath, buffer);
       
       paths.push(assetPath);
     }

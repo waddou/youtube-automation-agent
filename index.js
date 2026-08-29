@@ -1415,6 +1415,9 @@ class YouTubeAutomationAgent {
     // Step 1: Strategy
     const strategy = await this.runGenerationStage(jobId, 'strategy', 10, async () => {
       const generated = await this.agents.strategy.generateContentStrategy(topic);
+      if (!generated || typeof generated !== 'object') {
+        throw new Error('Strategy agent returned invalid result');
+      }
       const contentStyles = new Set(['tutorial', 'explainer', 'list', 'review', 'story']);
       const requestedStyle = style || profile.default_style || null;
       if (requestedStyle && contentStyles.has(requestedStyle.toLowerCase())) {

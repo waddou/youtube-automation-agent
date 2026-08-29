@@ -12,7 +12,7 @@ class OAuthServer {
   }
 
   setupRoutes() {
-    this.app.get('/auth/callback', async (req, res) => {
+    this.app.get('/oauth2callback', async (req, res) => {
       const { code, error } = req.query;
       
       if (error) {

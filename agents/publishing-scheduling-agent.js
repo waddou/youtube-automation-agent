@@ -391,13 +391,17 @@ class PublishingSchedulingAgent {
     try {
       const captionsContent = await fs.readFile(captionsPath, 'utf8');
       
+      const videoLanguage = process.env.DEFAULT_VIDEO_LANGUAGE || process.env.DEFAULT_LANGUAGE || 'fr';
+      const captionLanguage = videoLanguage === 'fr' ? 'fr' : 'en';
+      const captionName = videoLanguage === 'fr' ? 'Sous-titres français' : 'English Captions';
+      
       await this.youtube.captions.insert({
         part: 'snippet',
         requestBody: {
           snippet: {
             videoId: videoId,
-            language: 'en',
-            name: 'English Captions',
+            language: captionLanguage,
+            name: captionName,
             isDraft: false
           }
         },

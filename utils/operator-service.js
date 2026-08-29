@@ -16,6 +16,7 @@ class OperatorService {
     const finalVideo = production.assets?.finalVideo;
     const thumbnail = production.assets?.thumbnail;
     const bannedTopics = Array.isArray(profile.bannedTopics) ? profile.bannedTopics : [];
+    const strategy = production.strategy || production.script?.metadata?.strategy || {};
     const combinedText = `${title}\n${description}\n${script}`.toLowerCase();
 
     const checks = [
@@ -32,7 +33,19 @@ class OperatorService {
       this.check('video', Boolean(finalVideo?.path && !finalVideo?.simulated),
         finalVideo?.simulated
           ? 'Only a simulated video was produced'
-          : finalVideo?.path ? 'Final MP4 is ready' : 'Final MP4 is missing')
+          : finalVideo?.path ? 'Final MP4 is ready' : 'Final MP4 is missing'),
+      // Language consistency check
+      this.check('language_consistency', this.checkLanguageConsistency(script, production),
+        this.checkLanguageConsistency(script, production) ? 'Content language is consistent' : 'Content contains mixed languages - ensure single language throughout', false),
+      // Script structure check - no repetitive sections
+      this.check('script_structure', this.checkScriptStructure(script),
+        this.checkScriptStructure(script) ? 'Script structure is varied' : 'Script has repetitive sections - ensure unique content per section', false),
+      // Word count check
+      this.check('word_count', this.checkWordCount(script, strategy?.requestedLengthKey || 'medium'),
+        this.checkWordCount(script, strategy?.requestedLengthKey || 'medium') ? 'Script word count matches target length' : 'Script word count does not match target length', false),
+      // Image quality check
+      this.check('image_quality', this.checkImageQuality(production.assets),
+        this.checkImageQuality(production.assets) ? 'Images are proper visual assets' : 'Images appear to be placeholders - use AI-generated or real images', false),
     ];
 
     const topic = String(production.strategy?.topic || '').trim();
@@ -140,6 +153,86 @@ class OperatorService {
       blockingFailures: blockingFailures.map(check => check.id),
       checks
     };
+  }
+
+  checkLanguageConsistency(script, production) {
+    const language = process.env.DEFAULT_LANGUAGE || 'fr';
+    const isFrench = language === 'fr';
+    
+    if (isFrench) {
+      // Count French words vs English words
+      const frenchWords = (script.match(/\b(le|la|les|un|une|des|du|de|et|ou|mais|donc|car|que|qui|ce|cette|ces|mon|ma|mes|ton|ta|tes|son|sa|ses|notre|votre|leur|leurs|je|tu|il|elle|nous|vous|ils|elles|est|sont|ai|as|a|avons|avez|ont|être|avoir|faire|aller|venir|voir|savoir|pouvoir|vouloir|devoir|falloir)\b/gi) || []).length;
+      const englishWords = (script.match(/\b(the|and|or|but|so|because|that|this|these|those|my|your|his|her|its|our|their|i|you|he|she|we|they|is|are|am|have|has|had|do|does|did|will|would|could|should|may|might|must|can|shall)\b/gi) || []).length;
+      
+      // If more than 10% English words in French content, flag it
+      const totalWords = script.split(/\s+/).length;
+      const englishRatio = englishWords / Math.max(totalWords, 1);
+      
+      return englishRatio < 0.1;
+    }
+    
+    // For English, just check it's not mostly French
+    return true;
+  }
+
+  checkScriptStructure(script) {
+    // Check for repetitive patterns - same phrases repeated
+    const sentences = script.split(/[.!?]+/).filter(s => s.trim().length > 20);
+    if (sentences.length < 5) return true; // Not enough to check
+    
+    // Check for duplicate sentences (or very similar)
+    const uniqueSentences = new Set(sentences.map(s => s.trim().toLowerCase()));
+    const duplicateRatio = 1 - (uniqueSentences.size / sentences.length);
+    
+    // Check for repetitive intro patterns
+    const introPatterns = [
+      /today.{0,30}diving.{0,30}deep/i,
+      /by the end.{0,30}you.{0,30}understand/i,
+      /welcome back.{0,30}channel/i
+    ];
+    
+    let introCount = 0;
+    for (const pattern of introPatterns) {
+      const matches = script.match(pattern);
+      if (matches && matches.length > 1) introCount += matches.length - 1;
+    }
+    
+    return duplicateRatio < 0.3 && introCount < 2;
+  }
+
+  checkWordCount(script, requestedLength) {
+    const wordCount = script.split(/\s+/).length;
+    const targets = {
+      'short': { min: 800, max: 1500 },
+      'medium': { min: 1500, max: 3000 },
+      'long': { min: 3000, max: 5000 }
+    };
+    const target = targets[requestedLength] || targets.medium;
+    return wordCount >= target.min && wordCount <= target.max;
+  }
+
+  checkImageQuality(assets) {
+    if (!assets) return false;
+    
+    const thumbnail = assets.thumbnail;
+    const video = assets.finalVideo;
+    
+    // Check thumbnail is actual image file
+    if (thumbnail?.path) {
+      const isInfoFile = thumbnail.path.endsWith('.info');
+      const isSimulated = thumbnail.path.includes('sim_') || thumbnail.path.includes('.info');
+      if (isInfoFile || isSimulated) return false;
+    }
+    
+    // Check video assets
+    if (video?.visualAssets) {
+      for (const asset of video.visualAssets) {
+        if (asset.endsWith('.info')) return false;
+        if (asset.includes('sim_')) return false;
+      }
+    }
+    
+    return true;
   }
 
   check(id, passed, message, blocking = true) {

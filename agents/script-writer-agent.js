@@ -106,6 +106,7 @@ class ScriptWriterAgent {
       return null;
     }
 
+    const language = process.env.DEFAULT_LANGUAGE || 'fr';
     const prompt = `You are writing a YouTube script plan.
 Return only valid JSON with this exact shape:
 {
@@ -120,6 +121,7 @@ Return only valid JSON with this exact shape:
   ]
 }
 
+Language: ${language === 'fr' ? 'French (français)' : 'English'}
 Topic: ${strategy.topic}
 Style/content type: ${strategy.contentType}
 Angle: ${strategy.angle}
@@ -135,7 +137,7 @@ Channel constraints: ${strategy.channelConstraints || 'none beyond the factual-s
 Preferred call to action: ${strategy.callToAction || 'invite the viewer to subscribe'}
 Keywords: ${(strategy.keywords || []).join(', ')}
 Research sources: ${JSON.stringify(strategy.researchSources || [])}
-Avoid fabricated statistics, unsupported claims, and fake urgency. List every externally verifiable factual claim in claims. Use only exact URLs from Research sources; use an empty sourceUrls array when the supplied sources do not support a claim.`;
+Avoid fabricated statistics, unsupported claims, and fake urgency. List every externally verifiable factual claim in claims. Use only exact URLs from Research sources; use an empty sourceUrls array when the supplied sources do not support a claim. All output must be in ${language === 'fr' ? 'French' : 'English'}.`;
 
     try {
       const response = await this.aiTextService.generateText(prompt, {
@@ -288,7 +290,31 @@ Avoid fabricated statistics, unsupported claims, and fake urgency. List every ex
   }
 
   async generateHook(strategy) {
-    const hooks = [
+    const language = process.env.DEFAULT_LANGUAGE || 'fr';
+    const isFrench = language === 'fr';
+    
+    const hooks = isFrench ? [
+      {
+        type: 'question',
+        text: `Vous êtes-vous déjà demandé ${this.generateQuestionAboutFR(strategy.topic)} ?`
+      },
+      {
+        type: 'statistic',
+        text: `Savez-vous que ${this.generateStatisticFR(strategy.topic)} ?`
+      },
+      {
+        type: 'statement',
+        text: `${strategy.topic} va tout changer, et voici pourquoi...`
+      },
+      {
+        type: 'challenge',
+        text: `La plupart des gens croient comprendre ${strategy.topic}, mais ils ont tout faux.`
+      },
+      {
+        type: 'promise',
+        text: `Dans les prochaines minutes, vous allez apprendre exactement comment maîtriser ${strategy.topic}.`
+      }
+    ] : [
       {
         type: 'question',
         text: `Have you ever wondered ${this.generateQuestionAbout(strategy.topic)}?`
@@ -332,6 +358,18 @@ Avoid fabricated statistics, unsupported claims, and fake urgency. List every ex
     return questions[Math.floor(Math.random() * questions.length)];
   }
 
+  generateQuestionAboutFR(topic) {
+    const questions = [
+      `pourquoi ${topic} devient si important`,
+      `comment ${topic} fonctionne vraiment`,
+      `ce qui rend ${topic} différent de tout le reste`,
+      `pourquoi les experts parlent de ${topic}`,
+      `comment ${topic} pourrait changer votre vie`
+    ];
+    
+    return questions[Math.floor(Math.random() * questions.length)];
+  }
+
   generateStatistic(topic) {
     const stats = [
       `many people are still figuring out how ${topic} works`,
@@ -344,12 +382,27 @@ Avoid fabricated statistics, unsupported claims, and fake urgency. List every ex
     return stats[Math.floor(Math.random() * stats.length)];
   }
 
+  generateStatisticFR(topic) {
+    const stats = [
+      `beaucoup de gens cherchent encore à comprendre comment fonctionne ${topic}`,
+      `la conversation autour de ${topic} ne cesse de s'élargir`,
+      `les experts continuent de débattre sur l'avenir de ${topic}`,
+      `on passe souvent à côté de l'aspect pratique de ${topic}`,
+      `${topic} peut être plus simple à aborder avec un bon cadre`
+    ];
+    
+    return stats[Math.floor(Math.random() * stats.length)];
+  }
+
   async generateIntroduction(strategy) {
+    const language = process.env.DEFAULT_LANGUAGE || 'fr';
+    const isFrench = language === 'fr';
+    
     return {
-      greeting: "Hey everyone, welcome back to the channel!",
-      topicIntro: `Today, we're diving deep into ${strategy.topic}.`,
-      valueProposition: `By the end of this video, you'll understand exactly ${this.getValueProposition(strategy)}.`,
-      credibility: this.getCredibilityStatement(strategy),
+      greeting: isFrench ? "Bonjour à tous, bienvenue sur la chaîne !" : "Hey everyone, welcome back to the channel!",
+      topicIntro: isFrench ? `Aujourd'hui, nous allons voir en détail ${strategy.topic}.` : `Today, we're diving deep into ${strategy.topic}.`,
+      valueProposition: isFrench ? `À la fin de cette vidéo, vous comprendrez exactement ${this.getValuePropositionFR(strategy)}.` : `By the end of this video, you'll understand exactly ${this.getValueProposition(strategy)}.`,
+      credibility: this.getCredibilityStatementFR(strategy),
       duration: '0:05-0:20'
     };
   }
@@ -366,6 +419,18 @@ Avoid fabricated statistics, unsupported claims, and fake urgency. List every ex
     return propositions[strategy.contentType] || `everything about ${strategy.topic}`;
   }
 
+  getValuePropositionFR(strategy) {
+    const propositions = {
+      'Tutorial': `comment mettre en œuvre ${strategy.topic} étape par étape`,
+      'Explainer': `ce qu'est ${strategy.topic} et pourquoi cela compte`,
+      'List': `les choses les plus importantes à savoir sur ${strategy.topic}`,
+      'Review': `si ${strategy.topic} est fait pour vous`,
+      'Story': `l'incroyable histoire de ${strategy.topic}`
+    };
+    
+    return propositions[strategy.contentType] || `tout sur ${strategy.topic}`;
+  }
+
   getCredibilityStatement(_strategy) {
     const statements = [
       "I've spent months researching this topic",
@@ -373,6 +438,18 @@ Avoid fabricated statistics, unsupported claims, and fake urgency. List every ex
       "Based on the latest research and data",
       "Drawing from real-world experience",
       "Using proven methods and strategies"
+    ];
+    
+    return statements[Math.floor(Math.random() * statements.length)];
+  }
+
+  getCredibilityStatementFR(_strategy) {
+    const statements = [
+      "J'ai passé des mois à rechercher ce sujet",
+      "Après avoir accompagné des centaines de personnes sur ce thème",
+      "Basé sur les dernières recherches et données",
+      "Fort d'une expérience terrain",
+      "En utilisant des méthodes éprouvées"
     ];
     
     return statements[Math.floor(Math.random() * statements.length)];
@@ -572,7 +649,16 @@ Avoid fabricated statistics, unsupported claims, and fake urgency. List every ex
   }
 
   generateImpactStatement() {
-    const impacts = [
+    const language = process.env.DEFAULT_LANGUAGE || 'fr';
+    const isFrench = language === 'fr';
+    
+    const impacts = isFrench ? [
+      'Cela seul peut vous faire gagner des heures',
+      'Un vrai game-changer pour les débutants',
+      'Indispensable pour réussir sur le long terme',
+      'Souvent négligé mais crucial',
+      'La différence entre succès et échec'
+    ] : [
       'This alone can save you hours',
       'Game-changing for beginners',
       'Essential for long-term success',
@@ -584,10 +670,19 @@ Avoid fabricated statistics, unsupported claims, and fake urgency. List every ex
   }
 
   async generatePros(_strategy) {
+    const language = process.env.DEFAULT_LANGUAGE || 'fr';
+    const isFrench = language === 'fr';
+    
     return {
       type: 'pros',
-      title: 'The Benefits',
-      points: [
+      title: isFrench ? 'Les avantages' : 'The Benefits',
+      points: isFrench ? [
+        'Facile à démarrer',
+        'Solution économique',
+        'Résultats prouvés',
+        'Approche évolutive',
+        'Support de la communauté'
+      ] : [
         'Easy to get started',
         'Cost-effective solution',
         'Proven results',
@@ -599,10 +694,18 @@ Avoid fabricated statistics, unsupported claims, and fake urgency. List every ex
   }
 
   async generateCons(_strategy) {
+    const language = process.env.DEFAULT_LANGUAGE || 'fr';
+    const isFrench = language === 'fr';
+    
     return {
       type: 'cons',
-      title: 'Things to Consider',
-      points: [
+      title: isFrench ? 'Points d\'attention' : 'Things to Consider',
+      points: isFrench ? [
+        'Courbe d\'apprentissage au début',
+        'Demande des efforts constants',
+        'Les résultats peuvent varier',
+        'Quelques connaissances techniques utiles'
+      ] : [
         'Learning curve at the beginning',
         'Requires consistent effort',
         'Results may vary',
@@ -613,11 +716,19 @@ Avoid fabricated statistics, unsupported claims, and fake urgency. List every ex
   }
 
   async generateComparison(strategy) {
+    const language = process.env.DEFAULT_LANGUAGE || 'fr';
+    const isFrench = language === 'fr';
+    
     return {
       type: 'comparison',
-      title: 'How It Compares',
-      content: `Compared to alternatives, ${strategy.topic} stands out because of its unique approach and proven effectiveness.`,
-      comparisonPoints: [
+      title: isFrench ? 'Comment ça se compare' : 'How It Compares',
+      content: isFrench ? `Par rapport aux alternatives, ${strategy.topic} se démarque par son approche unique et son efficacité prouvée.` : `Compared to alternatives, ${strategy.topic} stands out because of its unique approach and proven effectiveness.`,
+      comparisonPoints: isFrench ? [
+        'Plus efficace que les méthodes traditionnelles',
+        'Meilleur ROI que les concurrents',
+        'Plus facile à mettre en œuvre',
+        'Plus durable sur le long terme'
+      ] : [
         'More efficient than traditional methods',
         'Better ROI than competitors',
         'Easier to implement',
@@ -628,10 +739,18 @@ Avoid fabricated statistics, unsupported claims, and fake urgency. List every ex
   }
 
   async generateImplications(strategy) {
+    const language = process.env.DEFAULT_LANGUAGE || 'fr';
+    const isFrench = language === 'fr';
+    
     return {
       type: 'implications',
-      title: 'What This Means',
-      content: [
+      title: isFrench ? 'Ce que cela signifie' : 'What This Means',
+      content: isFrench ? [
+        `Les implications de ${strategy.topic} sont considérables.`,
+        'Cela va changer notre façon de voir l\'industrie.',
+        'Les premiers adopteurs auront un avantage significatif.',
+        'Le potentiel de croissance est énorme.'
+      ] : [
         `The implications of ${strategy.topic} are far-reaching.`,
         'This will change how we think about the industry.',
         'Early adopters will have a significant advantage.',
@@ -642,19 +761,32 @@ Avoid fabricated statistics, unsupported claims, and fake urgency. List every ex
   }
 
   generateGenericSection(sectionType, strategy) {
+    const language = process.env.DEFAULT_LANGUAGE || 'fr';
+    const isFrench = language === 'fr';
+    
     return {
       type: sectionType,
       title: sectionType.replace(/_/g, ' ').replace(/\b\w/g, l => l.toUpperCase()),
-      content: `This section covers important aspects of ${strategy.topic} that you need to know.`,
+      content: isFrench ? `Cette section couvre les aspects importants de ${strategy.topic} que vous devez connaître.` : `This section covers important aspects of ${strategy.topic} that you need to know.`,
       duration: 60
     };
   }
 
   async generateConclusion(strategy) {
+    const language = process.env.DEFAULT_LANGUAGE || 'fr';
+    const isFrench = language === 'fr';
+    
     return {
       type: 'conclusion',
-      title: 'Wrapping Up',
-      recap: [
+      title: isFrench ? 'En résumé' : 'Wrapping Up',
+      recap: isFrench ? [
+        `Voilà tout ce qu'il faut savoir sur ${strategy.topic}.`,
+        'Nous avons couvert les points clés :',
+        '- Les fondamentaux et pourquoi ils comptent',
+        '- Les étapes pratiques pour commencer',
+        '- Des applications concrètes et des exemples',
+        '- Des conseils pour réussir sur le long terme'
+      ] : [
         `So that's everything you need to know about ${strategy.topic}.`,
         'We covered the key points:',
         '- The fundamentals and why they matter',
@@ -662,18 +794,21 @@ Avoid fabricated statistics, unsupported claims, and fake urgency. List every ex
         '- Real-world applications and examples',
         '- Tips for long-term success'
       ],
-      finalThought: `Remember, ${strategy.topic} is a journey, not a destination. Keep learning and improving!`,
+      finalThought: isFrench ? `Rappelez-vous, ${strategy.topic} est un chemin, pas une destination. Continuez à apprendre et à progresser !` : `Remember, ${strategy.topic} is a journey, not a destination. Keep learning and improving!`,
       duration: '30 seconds'
     };
   }
 
   async generateCTA(strategy) {
+    const language = process.env.DEFAULT_LANGUAGE || 'fr';
+    const isFrench = language === 'fr';
+    
     return {
       type: 'call_to_action',
-      subscribe: "If you found this helpful, make sure to subscribe and hit the notification bell!",
-      like: "Give this video a thumbs up if you learned something new.",
-      comment: `Let me know in the comments: What's your experience with ${strategy.topic}?`,
-      nextVideo: "Check out this related video for more insights.",
+      subscribe: isFrench ? "Si cette vidéo vous a aidé, abonnez-vous et activez la cloche !" : "If you found this helpful, make sure to subscribe and hit the notification bell!",
+      like: isFrench ? "Mettez un pouce vers le haut si vous avez appris quelque chose." : "Give this video a thumbs up if you learned something new.",
+      comment: isFrench ? `Dites-moi en commentaire : quelle est votre expérience avec ${strategy.topic} ?` : `Let me know in the comments: What's your experience with ${strategy.topic}?`,
+      nextVideo: isFrench ? "Regardez la vidéo suivante pour aller plus loin." : "Check out this related video for more insights.",
       duration: '15 seconds'
     };
   }

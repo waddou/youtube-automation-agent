@@ -332,11 +332,13 @@ class ContentStrategyAgent {
 
   async generateAutonomousPlanWithAI(channelStrategy, research, targetCount) {
     if (!this.aiTextService.isAvailable()) return [];
+    const language = process.env.DEFAULT_LANGUAGE || 'fr';
     const prompt = `You are the strategy lead for an autonomous YouTube channel.
 Turn the channel strategy and the supplied research signals into a focused content plan.
 Return only a valid JSON array with exactly ${targetCount} items using this shape:
 [{"topic":"specific video topic","pillar":"one exact content pillar from the supplied strategy","angle":"distinct audience-relevant angle","rationale":"why this advances the channel objective using the supplied evidence","format":"explainer|tutorial|list|review|story","length":"short|medium|long","sourceUrls":["exact URL from the supplied source catalog"]}]
 
+Language: ${language === 'fr' ? 'French (français)' : 'English'}
 Channel objective: ${channelStrategy.objective}
 Audience: ${channelStrategy.audience}
 Value proposition: ${channelStrategy.value_proposition || 'not specified'}
@@ -353,7 +355,7 @@ Allowed source catalog: ${JSON.stringify(research.sourceCatalog)}
 Recent topics to avoid repeating: ${JSON.stringify(research.recentTopics)}
 Operator-approved performance learnings to apply: ${JSON.stringify(research.approvedLearnings)}
 
-Do not invent trend data, statistics, sources, URLs, or factual claims. Use only exact URLs from the supplied source catalog. Apply only the supplied approved learnings; pending or rejected recommendations are not authorized. Prefer evergreen topics when the supplied signals are weak. Learnings with category "audience_demand" are audience-requested topics mined from real comments on published videos; prefer planning a video that directly answers one when it fits the channel objective, and cite it in the rationale.`;
+Do not invent trend data, statistics, sources, URLs, or factual claims. Use only exact URLs from the supplied source catalog. Apply only the supplied approved learnings; pending or rejected recommendations are not authorized. Prefer evergreen topics when the supplied signals are weak. Learnings with category "audience_demand" are audience-requested topics mined from real comments on published videos; prefer planning a video that directly answers one when it fits the channel objective, and cite it in the rationale. All output must be in ${language === 'fr' ? 'French' : 'English'}.`;
 
     try {
       const response = await this.aiTextService.generateText(prompt, { maxTokens: 1800, temperature: 0.65 });
@@ -430,6 +432,7 @@ Do not invent trend data, statistics, sources, URLs, or factual claims. Use only
       .slice(0, 10)
       .map(topic => topic.topic)
       .join(', ');
+    const language = process.env.DEFAULT_LANGUAGE || 'fr';
     const prompt = `You are selecting a YouTube content strategy.
 Return only valid JSON with this exact shape:
 {
@@ -440,10 +443,11 @@ Return only valid JSON with this exact shape:
   "keywords": ["keyword"]
 }
 
+Language: ${language === 'fr' ? 'French (français)' : 'English'}
 Requested topic: ${requestedTopic || 'none'}
 Trending topics available: ${trendingTopics || 'Technology Trends'}
 Channel target audience: ${process.env.TARGET_AUDIENCE || 'General audience interested in educational content'}
-Avoid fabricated claims and unsupported numbers.`;
+Avoid fabricated claims and unsupported numbers. All output must be in ${language === 'fr' ? 'French' : 'English'}.`;
 
     try {
       const response = await this.aiTextService.generateText(prompt, {

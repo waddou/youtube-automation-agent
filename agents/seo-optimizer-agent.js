@@ -72,7 +72,7 @@ class SEOOptimizerAgent {
           primaryKeyword: strategy.keywords[0],
           secondaryKeywords: strategy.keywords.slice(1, 5),
           targetLength: this.calculateOptimalLength(strategy.contentType),
-          language: 'en',
+          language: process.env.DEFAULT_VIDEO_LANGUAGE || process.env.DEFAULT_LANGUAGE || 'fr',
           category: this.selectCategory(strategy)
         },
         createdAt: new Date().toISOString()
@@ -95,6 +95,7 @@ class SEOOptimizerAgent {
       return null;
     }
 
+    const language = process.env.DEFAULT_LANGUAGE || 'fr';
     const prompt = `You are optimizing YouTube metadata.
 Return only valid JSON with this exact shape:
 {
@@ -103,13 +104,14 @@ Return only valid JSON with this exact shape:
   "tags": ["tag"]
 }
 
+Language: ${language === 'fr' ? 'French (français)' : 'English'}
 Video title: ${script.title}
 Topic: ${strategy.topic}
 Angle: ${strategy.angle}
 Content type: ${strategy.contentType}
 Target audience: ${strategy.targetAudience}
 Keywords: ${(strategy.keywords || []).join(', ')}
-Keep tags under YouTube's 500 character total guidance. Avoid fabricated statistics and unsupported claims.`;
+Keep tags under YouTube's 500 character total guidance. Avoid fabricated statistics and unsupported claims. All output must be in ${language === 'fr' ? 'French' : 'English'}.`;
 
     try {
       const response = await this.aiTextService.generateText(prompt, {
