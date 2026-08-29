@@ -1306,11 +1306,30 @@ class AIVideoGenerator {
    */
   thumbnailHeadline(title) {
     const clean = String(title || '').replace(/\s+/g, ' ').trim();
-    // Titles are usually "Subject : qualifier"; the qualifier is the hook.
-    const [subject, ...rest] = clean.split(/\s*[:\u2014\u2013-]\s*/);
-    const qualifier = rest.join(' ').trim();
-    const headline = qualifier && qualifier.length <= 34 ? `${subject} - ${qualifier}` : subject;
-    return headline.slice(0, 48).toUpperCase();
+    // Titles read "Subject : qualifier"; only the subject fits on a thumbnail.
+    const subject = clean.split(/\s*[:\u2014\u2013]\s*/)[0].trim();
+
+    // Drop grammatical filler so the remaining words are the ones a viewer
+    // scans for \u2014 brand and object, not articles.
+    const filler = new Set([
+      'mon', 'ma', 'mes', 'le', 'la', 'les', 'un', 'une', 'des', 'du', 'de', 'd',
+      'au', 'aux', 'et', 'ou', 'pour', 'avec', 'sans', 'dans', 'sur', 'en', 'à',
+      'my', 'the', 'a', 'an', 'of', 'for', 'with', 'to', 'in', 'on',
+    ]);
+    const words = subject.split(/\s+/).filter(word => !filler.has(word.toLowerCase().replace(/[^a-z\u00e0-\u00ff]/gi, '')));
+
+    // Image models render a few large words cleanly and longer strings as
+    // garbled, clipped shapes \u2014 a 48-character headline came back as
+    // "CARIEFOUR ... CONNXION ... PAS \u00c0 PA". Four words, 26 characters, is the
+    // most that survives reliably.
+    const headline = [];
+    for (const word of words) {
+      const candidate = [...headline, word].join(' ');
+      if (headline.length >= 4 || candidate.length > 26) break;
+      headline.push(word);
+    }
+
+    return (headline.length ? headline.join(' ') : subject.slice(0, 26)).toUpperCase();
   }
 
   async getFileSize(filePath) {
