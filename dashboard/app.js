@@ -1675,7 +1675,13 @@ $('#generate-form').addEventListener('submit', async event => {
   event.preventDefault();
   const values = Object.fromEntries(new FormData(event.currentTarget));
   try {
-    await mutate('/generate', 'POST', { ...values, topic: values.topic.trim() || null }, 'Generation job started.');
+    // Empty optional fields must be sent as null, not '': the API rejects a
+    // blank string as an invalid URL.
+    await mutate('/generate', 'POST', {
+      ...values,
+      topic: values.topic.trim() || null,
+      sourceUrl: (values.sourceUrl || '').trim() || null
+    }, 'Generation job started.');
     $('#generate-dialog').close();
     event.currentTarget.reset();
   } catch (_error) { /* toast already shown */ }

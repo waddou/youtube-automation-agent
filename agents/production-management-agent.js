@@ -51,16 +51,20 @@ class ProductionManagementAgent {
       this.logger.info('Processing content for production...');
       
       const { strategy, script, thumbnail, seo, jobId = null } = contentData;
-      
+      // The ingested guide travels with the production so its screenshots can be
+      // matched to scenes and its URL cited as provenance.
+      const sourceDocument = contentData.sourceDocument || strategy?.sourceDocument || null;
+
       // Create production entry
       const productionId = this.generateProductionId();
-      
+
       const productionData = {
         id: productionId,
         strategy,
         script,
         thumbnail,
         seo,
+        sourceDocument,
         status: 'processing',
         assets: {
           script: await this.processScript(script),
@@ -154,68 +158,76 @@ class ProductionManagementAgent {
     };
   }
 
+  /**
+   * Build the exact text the narrator will speak.
+   *
+   * Everything here is heard by the viewer, so it must be pure narration in a
+   * single language. The previous version injected English scaffolding
+   * ("Section 1:", "Number 3:") into French scripts and the TTS engine read it
+   * aloud — the direct cause of videos that switched language mid-sentence.
+   * Structural markers are now dropped entirely rather than translated: a
+   * narrator announcing "Partie 3" sounds like a slide deck, and the section
+   * title already tells the viewer where they are.
+   */
   formatScriptForTTS(script) {
-    let ttsText = '';
-    
-    // Add hook
-    if (script.hook) {
-      ttsText += `${script.hook.text}\n\n`;
-    }
-    
-    // Add introduction
+    const lines = [];
+    const push = value => {
+      if (typeof value !== 'string') return;
+      const text = value.trim();
+      // Stage directions such as "[VISUELS: ...]" are for the editor, not the
+      // microphone.
+      if (!text || text.startsWith('[')) return;
+      lines.push(text);
+    };
+
+    if (script.hook) push(script.hook.text);
+
     if (script.introduction) {
-      ttsText += `${script.introduction.greeting}\n`;
-      ttsText += `${script.introduction.topicIntro}\n`;
-      ttsText += `${script.introduction.valueProposition}\n`;
-      ttsText += `${script.introduction.credibility}\n\n`;
+      push(script.introduction.greeting);
+      push(script.introduction.topicIntro);
+      push(script.introduction.valueProposition);
+      push(script.introduction.credibility);
+      lines.push('');
     }
-    
-    // Add main content
-    if (script.mainContent && script.mainContent.sections) {
-      script.mainContent.sections.forEach((section, index) => {
-        ttsText += `Section ${index + 1}: ${section.title}\n`;
-        
-        if (Array.isArray(section.content)) {
-          section.content.forEach(line => {
-            if (typeof line === 'string' && !line.startsWith('[')) {
-              ttsText += `${line}\n`;
-            }
-          });
-        } else if (section.steps) {
-          section.steps.forEach(step => {
-            ttsText += `${step.title}. ${step.description}\n`;
-            ttsText += `${step.tip}\n`;
-          });
-        } else if (section.items) {
-          section.items.forEach(item => {
-            ttsText += `Number ${item.number}: ${item.title}. ${item.description}\n`;
-          });
-        } else if (typeof section.content === 'string') {
-          ttsText += `${section.content}\n`;
-        }
-        
-        ttsText += '\n';
-      });
+
+    for (const section of script.mainContent?.sections || []) {
+      // The title is spoken as a sentence of its own: it gives the listener a
+      // chapter boundary without an artificial "Section N" prefix.
+      push(section.title);
+
+      if (Array.isArray(section.content)) {
+        section.content.forEach(push);
+      } else if (section.steps) {
+        section.steps.forEach(step => {
+          push([step.title, step.description].filter(Boolean).join('. '));
+          push(step.tip);
+        });
+      } else if (section.items) {
+        section.items.forEach(item => {
+          push([item.title, item.description].filter(Boolean).join('. '));
+        });
+      } else if (section.points) {
+        section.points.forEach(push);
+      } else if (typeof section.content === 'string') {
+        push(section.content);
+      }
+
+      lines.push('');
     }
-    
-    // Add conclusion
+
     if (script.conclusion) {
-      script.conclusion.recap.forEach(line => {
-        if (typeof line === 'string') {
-          ttsText += `${line}\n`;
-        }
-      });
-      ttsText += `\n${script.conclusion.finalThought}\n\n`;
+      (script.conclusion.recap || []).forEach(push);
+      push(script.conclusion.finalThought);
+      lines.push('');
     }
-    
-    // Add CTA
+
     if (script.callToAction) {
-      ttsText += `${script.callToAction.subscribe}\n`;
-      ttsText += `${script.callToAction.like}\n`;
-      ttsText += `${script.callToAction.comment}\n`;
+      push(script.callToAction.subscribe);
+      push(script.callToAction.like);
+      push(script.callToAction.comment);
     }
-    
-    return ttsText;
+
+    return lines.join('\n').replace(/\n{3,}/g, '\n\n').trim() + '\n';
   }
 
   async processThumbnail(thumbnail, script) {
@@ -295,30 +307,51 @@ class ProductionManagementAgent {
 
   async generateVideoContent(productionData) {
     this.logger.info('Generating AI video content...');
-    
+
     try {
       const { script } = productionData;
-      
-      // Generate visual assets using DALL-E
-      const visualPrompts = this.createVisualPromptsFromScript(script);
+      const sourceDocument = productionData.sourceDocument || script.metadata?.strategy?.sourceDocument || null;
+      const context = {
+        sourceDocument,
+        contentType: script.metadata?.strategy?.contentType || null,
+        language: script.language || script.metadata?.strategy?.language || null,
+      };
+
+      const briefs = this.createVisualPromptsFromScript(script, context);
+
+      // A screenshot of the page being explained beats any generated
+      // illustration of it, so real captures are matched to their section first
+      // and generation only fills the gaps.
+      const screenshots = this.matchScreenshotsToBriefs(briefs, sourceDocument);
+
       const visualAssets = [];
-      
-      for (const prompt of visualPrompts) {
-        const assets = await this.aiVideoGenerator.generateVisualAssets(prompt, 'ethereal', 1);
+      for (const [index, brief] of briefs.entries()) {
+        const screenshot = screenshots.get(index);
+        if (screenshot) {
+          visualAssets.push(screenshot);
+          continue;
+        }
+        const assets = await this.aiVideoGenerator.generateVisualAssets(brief.prompt, brief.style, 1);
         visualAssets.push(...assets);
       }
-      
+
       productionData.assets.video = {
         visualAssets: visualAssets,
+        visualBriefs: briefs.map((brief, index) => ({
+          label: brief.label,
+          style: brief.style,
+          sectionIndex: brief.sectionIndex,
+          source: screenshots.has(index) ? 'source_screenshot' : 'generated',
+        })),
         duration: productionData.estimatedDuration,
         format: 'mp4',
         resolution: '1920x1080',
         fps: 30,
         generatedWith: 'AI'
       };
-      
+
       productionData.timeline.videoGenerated = new Date().toISOString();
-      
+
       return visualAssets;
     } catch (error) {
       this.logger.error('AI video content generation failed:', error);
@@ -655,30 +688,145 @@ class ProductionManagementAgent {
   }
 
   // Helper method to create visual prompts from script content
-  createVisualPromptsFromScript(script) {
-    const prompts = [];
-    
-    // Title prompt
-    prompts.push(`${script.title}, ethereal storytelling, mystical background`);
-    
-    // Content-based prompts
-    if (script.mainContent && script.mainContent.sections) {
-      script.mainContent.sections.forEach(section => {
-        if (section.title) {
-          prompts.push(`${section.title}, ethereal dreamscape, creative visualization`);
-        }
+  /**
+   * Derive one visual brief per script section, from the words that section
+   * actually narrates.
+   *
+   * The previous implementation asked for "ethereal dreamscape, mystical
+   * storytelling" regardless of subject, so a step-by-step guide to an insurance
+   * portal was illustrated with cosmic artwork. Imagery now follows two rules:
+   * it is grounded in the section's own content, and its register is chosen from
+   * what the video is about rather than hardcoded.
+   */
+  createVisualPromptsFromScript(script, context = {}) {
+    const style = context.visualStyle || this.inferVisualStyle(script, context);
+    const briefs = [];
+
+    briefs.push({
+      label: script.title || 'Introduction',
+      prompt: this.describeVisual(script.title, script.hook?.text, style),
+      style,
+      sectionIndex: null,
+    });
+
+    for (const [index, section] of (script.mainContent?.sections || []).entries()) {
+      if (!section.title) continue;
+      const detail = Array.isArray(section.content)
+        ? section.content.join(' ')
+        : typeof section.content === 'string'
+          ? section.content
+          : (section.steps || section.items || [])
+            .map(entry => `${entry.title || ''} ${entry.description || ''}`)
+            .join(' ');
+
+      briefs.push({
+        label: section.title,
+        prompt: this.describeVisual(section.title, detail, style),
+        style,
+        sectionIndex: index,
       });
     }
-    
-    // Ensure we have at least 3 prompts
-    while (prompts.length < 3) {
-      prompts.push('ethereal dreamscape, mystical storytelling, creative visualization');
+
+    const maxVisuals = Math.max(3, Number(process.env.MAX_VISUAL_ASSETS || 8));
+    return briefs.slice(0, maxVisuals);
+  }
+
+  /**
+   * Pair captured screenshots with the script sections they illustrate.
+   *
+   * Matching is by shared significant terms between the screenshot's heading and
+   * the section title, because the script rephrases headings rather than copying
+   * them. The hero shot backs the opening brief, which has no heading of its own.
+   */
+  matchScreenshotsToBriefs(briefs, sourceDocument) {
+    const matched = new Map();
+    const shots = sourceDocument?.screenshots || [];
+    if (!shots.length) return matched;
+
+    const used = new Set();
+    const terms = text => new Set(
+      String(text || '')
+        .toLowerCase()
+        .normalize('NFD')
+        .replace(/[̀-ͯ]/g, '')
+        .split(/[^a-z0-9]+/)
+        .filter(word => word.length >= 4)
+    );
+
+    const hero = shots.find(shot => shot.kind === 'hero');
+    if (hero) {
+      matched.set(0, hero.path);
+      used.add(hero.path);
     }
-    
-    return prompts.slice(0, 5); // Limit to 5 for cost control
+
+    for (const [index, brief] of briefs.entries()) {
+      if (matched.has(index)) continue;
+      const briefTerms = terms(brief.label);
+      if (!briefTerms.size) continue;
+
+      let best = null;
+      let bestScore = 0;
+      for (const shot of shots) {
+        if (used.has(shot.path)) continue;
+        const shotTerms = terms(shot.label);
+        if (!shotTerms.size) continue;
+        const overlap = [...briefTerms].filter(term => shotTerms.has(term)).length;
+        const score = overlap / Math.min(briefTerms.size, shotTerms.size);
+        if (score > bestScore) {
+          bestScore = score;
+          best = shot;
+        }
+      }
+
+      // Demand a real overlap: a weak match would put the wrong screen under the
+      // narration, which is the failure mode this whole change exists to remove.
+      if (best && bestScore >= 0.5) {
+        matched.set(index, best.path);
+        used.add(best.path);
+      }
+    }
+
+    return matched;
+  }
+
+  /**
+   * Pick a visual register. Procedural content ("how do I find my account",
+   * "declare a claim") is best served by realistic screen and office imagery;
+   * abstract or narrative content tolerates a more stylised look.
+   */
+  inferVisualStyle(script, context = {}) {
+    if (context.sourceDocument) return 'interface';
+
+    const contentType = String(context.contentType || script.metadata?.strategy?.contentType || '').toLowerCase();
+    if (contentType === 'tutorial') return 'interface';
+
+    const haystack = [
+      script.title,
+      ...(script.mainContent?.sections || []).map(section => section.title),
+    ]
+      .filter(Boolean)
+      .join(' ')
+      .toLowerCase();
+
+    const proceduralMarkers = /(compte|espace client|connexion|identifiant|portail|application|site|banque|assurance|contrat|formulaire|d[ée]clarer|souscrire|login|account|dashboard|website|portal|app)/;
+    if (proceduralMarkers.test(haystack)) return 'interface';
+
+    return 'documentary';
+  }
+
+  describeVisual(title, detail, style) {
+    const subject = [title, detail]
+      .filter(value => typeof value === 'string' && value.trim())
+      .join('. ')
+      .replace(/\s+/g, ' ')
+      .trim()
+      .slice(0, 500);
+
+    return { subject, style };
   }
 
   // Fallback simulation methods
+
   async simulateAudioGeneration(productionData, failure = null) {
     const audioPath = path.join(__dirname, '..', 'data', 'audio', `${productionData.id}_narration.mp3`);
     

@@ -1,5 +1,17 @@
 const { Logger } = require('../utils/logger');
 const { AITextService } = require('../utils/ai-text-service');
+const { resolveLanguage, label, promptLanguageDirective } = require('../utils/i18n');
+const { SourceIngestionService } = require('../utils/source-ingestion-service');
+
+// Spoken-word budget per requested video length. The AI stage previously asked
+// for a 8-12 minute script but capped the response at 1800 tokens, so the JSON
+// was truncated, parsing failed, and the run silently fell back to the generic
+// English template — which is why finished videos were an introduction on loop.
+const LENGTH_BUDGETS = {
+  short: { words: 550, maxTokens: 3000, sections: 3 },
+  medium: { words: 1500, maxTokens: 7000, sections: 6 },
+  long: { words: 2600, maxTokens: 12000, sections: 9 },
+};
 
 class ScriptWriterAgent {
   constructor(db, credentials) {
@@ -45,12 +57,17 @@ class ScriptWriterAgent {
     };
   }
 
-  async generateScript(strategy) {
+  async generateScript(strategy, options = {}) {
     try {
       this.logger.info(`Generating script for: ${strategy.topic}`);
-      
+
+      // Pin the language for this run so every template helper resolves the same
+      // way. Reading the environment inside each helper used to let one part of
+      // a script be French and another English within a single video.
+      this.language = resolveLanguage(strategy.language);
+
       const template = this.templates[strategy.contentType.toLowerCase()] || this.templates.explainer;
-      const aiScript = await this.generateScriptWithAI(strategy, template);
+      const aiScript = await this.generateScriptWithAI(strategy, template, options);
       if (aiScript) {
         aiScript.fullScript = this.formatFullScript(aiScript);
         await this.db.saveScript(aiScript);
@@ -100,48 +117,62 @@ class ScriptWriterAgent {
     }
   }
 
-  async generateScriptWithAI(strategy, template) {
+  async generateScriptWithAI(strategy, template, options = {}) {
     if (!this.aiTextService.isAvailable()) {
       this.logger.info('Using template script generation because no AI text provider is configured');
       return null;
     }
 
-    const language = process.env.DEFAULT_LANGUAGE || 'fr';
-    const prompt = `You are writing a YouTube script plan.
-Return only valid JSON with this exact shape:
-{
+    const language = resolveLanguage(strategy.language);
+    const budget = LENGTH_BUDGETS[strategy.requestedLengthKey] || LENGTH_BUDGETS.medium;
+    const sourceDocument = strategy.sourceDocument || options.sourceDocument || null;
+
+    const prompt = [
+      'You are writing a YouTube script plan.',
+      'Return only valid JSON with this exact shape:',
+      `{
   "title": "compelling title under 100 characters",
   "hook": "opening hook in one sentence",
   "sections": [
-    { "title": "section title", "content": ["spoken script bullet"], "duration": 60 }
+    { "title": "section title", "content": ["spoken script sentence"], "duration": 60 }
   ],
   "cta": "clear call to action",
   "claims": [
     { "text": "specific factual claim a reviewer must verify", "riskLevel": "standard|high", "sourceUrls": ["exact supplied source URL"] }
   ]
-}
-
-Language: ${language === 'fr' ? 'French (français)' : 'English'}
-Topic: ${strategy.topic}
-Style/content type: ${strategy.contentType}
-Angle: ${strategy.angle}
-Target audience: ${strategy.targetAudience}
-Desired length: ${strategy.requestedLength || process.env.DEFAULT_VIDEO_LENGTH || '8-12 minutes'}
-Tone: ${template.tone}
-Pacing: ${template.pacing}
-Brand voice: ${strategy.brandVoice || 'clear, credible, and engaging'}
-Channel goal: ${strategy.channelGoal || 'help the viewer understand and act'}
-Channel value proposition: ${strategy.channelValueProposition || 'give the viewer practical value'}
-Editorial rationale: ${strategy.planRationale || 'fit the selected topic and audience'}
-Channel constraints: ${strategy.channelConstraints || 'none beyond the factual-safety rules below'}
-Preferred call to action: ${strategy.callToAction || 'invite the viewer to subscribe'}
-Keywords: ${(strategy.keywords || []).join(', ')}
-Research sources: ${JSON.stringify(strategy.researchSources || [])}
-Avoid fabricated statistics, unsupported claims, and fake urgency. List every externally verifiable factual claim in claims. Use only exact URLs from Research sources; use an empty sourceUrls array when the supplied sources do not support a claim. All output must be in ${language === 'fr' ? 'French' : 'English'}.`;
+}`,
+      '',
+      promptLanguageDirective(language),
+      '',
+      `Topic: ${strategy.topic}`,
+      `Style/content type: ${strategy.contentType}`,
+      `Angle: ${strategy.angle}`,
+      `Target audience: ${strategy.targetAudience}`,
+      `Desired length: ${strategy.requestedLength || process.env.DEFAULT_VIDEO_LENGTH || '8-12 minutes'}`,
+      `Tone: ${template.tone}`,
+      `Pacing: ${template.pacing}`,
+      `Brand voice: ${strategy.brandVoice || 'clear, credible, and engaging'}`,
+      `Channel goal: ${strategy.channelGoal || 'help the viewer understand and act'}`,
+      `Channel value proposition: ${strategy.channelValueProposition || 'give the viewer practical value'}`,
+      `Editorial rationale: ${strategy.planRationale || 'fit the selected topic and audience'}`,
+      `Channel constraints: ${strategy.channelConstraints || 'none beyond the factual-safety rules below'}`,
+      `Preferred call to action: ${strategy.callToAction || 'invite the viewer to subscribe'}`,
+      `Keywords: ${(strategy.keywords || []).join(', ')}`,
+      `Research sources: ${JSON.stringify(strategy.researchSources || [])}`,
+      '',
+      this.buildLengthDirective(budget),
+      this.buildSourceDirective(sourceDocument),
+      'Avoid fabricated statistics, unsupported claims, and fake urgency. List every externally verifiable factual claim in claims.',
+      'Use only exact URLs from Research sources; use an empty sourceUrls array when the supplied sources do not support a claim.',
+      'Never restate the introduction inside a later section: each section must add information the viewer did not already hear.',
+      options.arbiterFeedback ? `\n${options.arbiterFeedback}` : '',
+    ]
+      .filter(Boolean)
+      .join('\n');
 
     try {
       const response = await this.aiTextService.generateText(prompt, {
-        maxTokens: 1800,
+        maxTokens: budget.maxTokens,
         temperature: 0.7
       });
       const parsed = this.parseAIJsonResponse(response);
@@ -155,6 +186,7 @@ Avoid fabricated statistics, unsupported claims, and fake urgency. List every ex
       return {
         title: String(parsed.title).slice(0, 100),
         hook: this.normalizeAIHook(parsed.hook),
+        language,
         introduction: await this.generateIntroduction(strategy),
         mainContent: {
           sections,
@@ -178,6 +210,49 @@ Avoid fabricated statistics, unsupported claims, and fake urgency. List every ex
       this.logger.warn(`AI script generation failed; using template fallback: ${error.message}`);
       return null;
     }
+  }
+
+  /**
+   * State the word budget explicitly. Models under-deliver badly when asked for
+   * a duration ("8-12 minutes") instead of a quantity, and an under-length
+   * script is what leaves a video padded with repeated filler.
+   */
+  buildLengthDirective(budget) {
+    return (
+      `Write approximately ${budget.words} words of spoken narration in total, ` +
+      `spread across at least ${budget.sections} substantive sections. ` +
+      'The "content" array of each section must contain full spoken sentences, not bullet keywords.'
+    );
+  }
+
+  /**
+   * When the operator supplied a guide, the script is an adaptation of that
+   * guide — not a loosely related essay. The outline is handed over as an
+   * ordered contract so the video walks the reader through the same chapters.
+   */
+  buildSourceDirective(sourceDocument) {
+    const context = SourceIngestionService.toPromptContext(sourceDocument);
+    if (!context || !context.outline?.length) return '';
+
+    const outline = context.outline
+      .map(entry => `${entry.order}. ${entry.heading}\n   ${entry.summary.replace(/\s+/g, ' ').trim()}`)
+      .join('\n');
+
+    return [
+      '',
+      'SOURCE GUIDE — this script is an adaptation of the following document.',
+      `Source title: ${context.title}`,
+      `Source URL: ${context.url}`,
+      'Its table of contents is the required structure of the video:',
+      outline,
+      '',
+      'Rules for using the source guide:',
+      '- Create one script section per numbered chapter above, in the same order.',
+      '- Base each section on that chapter\'s actual content; do not invent facts absent from it.',
+      '- Open by announcing what the video will cover (the table of contents), then deliver it.',
+      '- Do not pad with generic advice: everything must trace back to the source guide.',
+      '',
+    ].join('\n');
   }
 
   parseAIJsonResponse(response) {
@@ -223,9 +298,10 @@ Avoid fabricated statistics, unsupported claims, and fake urgency. List every ex
           .map(line => String(line).trim())
           .filter(Boolean);
 
+        const language = resolveLanguage(strategy.language);
         return {
           type: 'ai_generated',
-          title: String(section.title || `${strategy.topic} Part ${index + 1}`).trim(),
+          title: String(section.title || `${strategy.topic} — ${label(language, 'section')} ${index + 1}`).trim(),
           content,
           duration: parseInt(section.duration, 10) || 60
         };
@@ -246,38 +322,71 @@ Avoid fabricated statistics, unsupported claims, and fake urgency. List every ex
   }
 
   normalizeAICTA(cta, strategy) {
+    const fallback = this.ctaFallback(strategy);
     if (cta && typeof cta === 'object') {
       return {
         type: 'call_to_action',
-        subscribe: String(cta.subscribe || cta.text || `Subscribe for more on ${strategy.topic}.`),
-        like: String(cta.like || 'Like this video if it helped.'),
-        comment: String(cta.comment || `Share your experience with ${strategy.topic} in the comments.`),
-        nextVideo: String(cta.nextVideo || 'Watch the next related video for more context.'),
+        subscribe: String(cta.subscribe || cta.text || fallback.subscribe),
+        like: String(cta.like || fallback.like),
+        comment: String(cta.comment || fallback.comment),
+        nextVideo: String(cta.nextVideo || fallback.nextVideo),
         duration: '15 seconds'
       };
     }
 
     return {
       type: 'call_to_action',
-      subscribe: String(cta || `Subscribe for more practical videos about ${strategy.topic}.`),
-      like: 'Like this video if it helped.',
-      comment: `Share your experience with ${strategy.topic} in the comments.`,
-      nextVideo: 'Watch the next related video for more context.',
+      subscribe: String(cta || fallback.subscribe),
+      like: fallback.like,
+      comment: fallback.comment,
+      nextVideo: fallback.nextVideo,
       duration: '15 seconds'
     };
   }
-  async generateTitle(strategy) {
-    const templates = [
-      `${strategy.angle}`,
-      `${strategy.topic}: The Complete Guide`,
-      `Everything You Need to Know About ${strategy.topic}`,
-      `${strategy.topic} in ${new Date().getFullYear()}: What's Changed?`,
-      `The Truth About ${strategy.topic} (Shocking Results)`,
-      `How to Master ${strategy.topic} in 30 Days`,
-      `${strategy.topic}: Beginner to Expert Guide`
-    ];
 
-    // Select based on content type
+  ctaFallback(strategy) {
+    if (resolveLanguage(strategy.language) === 'fr') {
+      return {
+        subscribe: `Abonnez-vous pour d'autres vidéos pratiques sur ${strategy.topic}.`,
+        like: 'Mettez un pouce bleu si cette vidéo vous a aidé.',
+        comment: `Partagez votre expérience avec ${strategy.topic} en commentaire.`,
+        nextVideo: 'Regardez la vidéo suivante pour aller plus loin.',
+      };
+    }
+    return {
+      subscribe: `Subscribe for more practical videos about ${strategy.topic}.`,
+      like: 'Like this video if it helped.',
+      comment: `Share your experience with ${strategy.topic} in the comments.`,
+      nextVideo: 'Watch the next related video for more context.',
+    };
+  }
+
+  async generateTitle(strategy) {
+    const year = new Date().getFullYear();
+
+    if (resolveLanguage(strategy.language) === 'fr') {
+      // When a source guide drives the run, its own title is the most accurate
+      // description of what the video actually delivers.
+      if (strategy.sourceDocument?.title) {
+        return String(strategy.sourceDocument.title).slice(0, 100);
+      }
+      const byType = {
+        Tutorial: `${strategy.topic} : le guide étape par étape`,
+        List: `${strategy.topic} : les points essentiels à connaître`,
+        Review: `${strategy.topic} : est-ce vraiment utile ?`,
+      };
+      if (byType[strategy.contentType]) return byType[strategy.contentType];
+
+      const templates = [
+        `${strategy.angle}`,
+        `${strategy.topic} : le guide complet`,
+        `Tout ce qu'il faut savoir sur ${strategy.topic}`,
+        `${strategy.topic} en ${year} : ce qui change`,
+        `${strategy.topic} : du débutant à l'expert`,
+      ].filter(Boolean);
+      return templates[Math.floor(Math.random() * templates.length)];
+    }
+
     if (strategy.contentType === 'Tutorial') {
       return `How to ${strategy.topic}: Step-by-Step Guide`;
     } else if (strategy.contentType === 'List') {
@@ -286,11 +395,18 @@ Avoid fabricated statistics, unsupported claims, and fake urgency. List every ex
       return `${strategy.topic} Review: Is It Worth It?`;
     }
 
+    const templates = [
+      `${strategy.angle}`,
+      `${strategy.topic}: The Complete Guide`,
+      `Everything You Need to Know About ${strategy.topic}`,
+      `${strategy.topic} in ${year}: What's Changed?`,
+      `${strategy.topic}: Beginner to Expert Guide`
+    ].filter(Boolean);
     return templates[Math.floor(Math.random() * templates.length)];
   }
 
   async generateHook(strategy) {
-    const language = process.env.DEFAULT_LANGUAGE || 'fr';
+    const language = resolveLanguage(this.language);
     const isFrench = language === 'fr';
     
     const hooks = isFrench ? [
@@ -395,7 +511,7 @@ Avoid fabricated statistics, unsupported claims, and fake urgency. List every ex
   }
 
   async generateIntroduction(strategy) {
-    const language = process.env.DEFAULT_LANGUAGE || 'fr';
+    const language = resolveLanguage(this.language);
     const isFrench = language === 'fr';
     
     return {
@@ -649,7 +765,7 @@ Avoid fabricated statistics, unsupported claims, and fake urgency. List every ex
   }
 
   generateImpactStatement() {
-    const language = process.env.DEFAULT_LANGUAGE || 'fr';
+    const language = resolveLanguage(this.language);
     const isFrench = language === 'fr';
     
     const impacts = isFrench ? [
@@ -670,7 +786,7 @@ Avoid fabricated statistics, unsupported claims, and fake urgency. List every ex
   }
 
   async generatePros(_strategy) {
-    const language = process.env.DEFAULT_LANGUAGE || 'fr';
+    const language = resolveLanguage(this.language);
     const isFrench = language === 'fr';
     
     return {
@@ -694,7 +810,7 @@ Avoid fabricated statistics, unsupported claims, and fake urgency. List every ex
   }
 
   async generateCons(_strategy) {
-    const language = process.env.DEFAULT_LANGUAGE || 'fr';
+    const language = resolveLanguage(this.language);
     const isFrench = language === 'fr';
     
     return {
@@ -716,7 +832,7 @@ Avoid fabricated statistics, unsupported claims, and fake urgency. List every ex
   }
 
   async generateComparison(strategy) {
-    const language = process.env.DEFAULT_LANGUAGE || 'fr';
+    const language = resolveLanguage(this.language);
     const isFrench = language === 'fr';
     
     return {
@@ -739,7 +855,7 @@ Avoid fabricated statistics, unsupported claims, and fake urgency. List every ex
   }
 
   async generateImplications(strategy) {
-    const language = process.env.DEFAULT_LANGUAGE || 'fr';
+    const language = resolveLanguage(this.language);
     const isFrench = language === 'fr';
     
     return {
@@ -761,7 +877,7 @@ Avoid fabricated statistics, unsupported claims, and fake urgency. List every ex
   }
 
   generateGenericSection(sectionType, strategy) {
-    const language = process.env.DEFAULT_LANGUAGE || 'fr';
+    const language = resolveLanguage(this.language);
     const isFrench = language === 'fr';
     
     return {
@@ -773,7 +889,7 @@ Avoid fabricated statistics, unsupported claims, and fake urgency. List every ex
   }
 
   async generateConclusion(strategy) {
-    const language = process.env.DEFAULT_LANGUAGE || 'fr';
+    const language = resolveLanguage(this.language);
     const isFrench = language === 'fr';
     
     return {
@@ -800,7 +916,7 @@ Avoid fabricated statistics, unsupported claims, and fake urgency. List every ex
   }
 
   async generateCTA(strategy) {
-    const language = process.env.DEFAULT_LANGUAGE || 'fr';
+    const language = resolveLanguage(this.language);
     const isFrench = language === 'fr';
     
     return {
@@ -814,30 +930,31 @@ Avoid fabricated statistics, unsupported claims, and fake urgency. List every ex
   }
 
   formatFullScript(script) {
+    // Reference document for humans: it carries timing markers and stage
+    // directions. It is deliberately NOT what gets narrated — see
+    // ProductionManagementAgent.formatScriptForTTS for the spoken text.
+    const lang = resolveLanguage(script.language || this.language);
+    const t = key => label(lang, key);
     let fullScript = '';
-    
-    // Title
-    fullScript += `TITLE: ${script.title}\n\n`;
-    fullScript += '═'.repeat(50) + '\n\n';
-    
-    // Hook
-    fullScript += `[${script.hook.duration}] HOOK\n`;
+
+    fullScript += `${t('title')}: ${script.title}\n\n`;
+    fullScript += '\u2550'.repeat(50) + '\n\n';
+
+    fullScript += `[${script.hook.duration}] ${t('hook')}\n`;
     fullScript += `${script.hook.text}\n\n`;
-    
-    // Introduction
-    fullScript += `[${script.introduction.duration}] INTRODUCTION\n`;
+
+    fullScript += `[${script.introduction.duration}] ${t('introduction')}\n`;
     fullScript += `${script.introduction.greeting}\n`;
     fullScript += `${script.introduction.topicIntro}\n`;
     fullScript += `${script.introduction.valueProposition}\n`;
     fullScript += `${script.introduction.credibility}\n\n`;
-    
-    // Main Content
-    fullScript += 'MAIN CONTENT\n';
-    fullScript += '─'.repeat(30) + '\n\n';
-    
+
+    fullScript += `${t('mainContent')}\n`;
+    fullScript += '\u2500'.repeat(30) + '\n\n';
+
     for (const section of script.mainContent.sections) {
       fullScript += `[${this.formatDuration(section.duration)}] ${section.title.toUpperCase()}\n`;
-      
+
       if (Array.isArray(section.content)) {
         section.content.forEach(line => {
           fullScript += `${line}\n`;
@@ -846,50 +963,47 @@ Avoid fabricated statistics, unsupported claims, and fake urgency. List every ex
         section.steps.forEach(step => {
           fullScript += `\n${step.title}\n`;
           fullScript += `${step.description}\n`;
-          fullScript += `💡 ${step.tip}\n`;
+          fullScript += `${t('tip')} : ${step.tip}\n`;
         });
       } else if (section.items) {
         section.items.forEach(item => {
-          fullScript += `\n#${item.number}: ${item.title}\n`;
+          fullScript += `\n#${item.number} : ${item.title}\n`;
           fullScript += `${item.description}\n`;
-          fullScript += `Impact: ${item.impact}\n`;
+          fullScript += `${t('impact')} : ${item.impact}\n`;
         });
       } else if (section.points) {
         section.points.forEach(point => {
-          fullScript += `• ${point}\n`;
+          fullScript += `\u2022 ${point}\n`;
         });
       } else {
         fullScript += `${section.content}\n`;
       }
-      
+
       if (section.visuals) {
-        fullScript += `\n[VISUALS: ${section.visuals.join(', ')}]\n`;
+        fullScript += `\n[${t('visuals')}: ${section.visuals.join(', ')}]\n`;
       }
-      
+
       fullScript += '\n';
     }
-    
-    // Conclusion
-    fullScript += `[${script.conclusion.duration}] CONCLUSION\n`;
+
+    fullScript += `[${script.conclusion.duration}] ${t('conclusion')}\n`;
     script.conclusion.recap.forEach(line => {
       fullScript += `${line}\n`;
     });
     fullScript += `\n${script.conclusion.finalThought}\n\n`;
-    
-    // Call to Action
-    fullScript += `[${script.callToAction.duration}] CALL TO ACTION\n`;
+
+    fullScript += `[${script.callToAction.duration}] ${t('callToAction')}\n`;
     fullScript += `${script.callToAction.subscribe}\n`;
     fullScript += `${script.callToAction.like}\n`;
     fullScript += `${script.callToAction.comment}\n`;
     fullScript += `${script.callToAction.nextVideo}\n\n`;
-    
-    // Metadata
-    fullScript += '═'.repeat(50) + '\n';
-    fullScript += `ESTIMATED DURATION: ${script.duration}\n`;
-    fullScript += `TONE: ${script.tone}\n`;
-    fullScript += `PACING: ${script.pacing}\n`;
-    fullScript += `KEYWORDS: ${script.keywords.join(', ')}\n`;
-    
+
+    fullScript += '\u2550'.repeat(50) + '\n';
+    fullScript += `${t('estimatedDuration')}: ${script.duration}\n`;
+    fullScript += `${t('tone')}: ${script.tone}\n`;
+    fullScript += `${t('pacing')}: ${script.pacing}\n`;
+    fullScript += `${t('keywords')}: ${(script.keywords || []).join(', ')}\n`;
+
     return fullScript;
   }
 

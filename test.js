@@ -63,7 +63,13 @@ class SystemTest {
       { name: 'Reply Approval and Posting', test: () => this.testReplyApprovalAndPosting() },
       { name: 'Engagement AI Provider Wiring', test: () => this.testEngagementAIProviderWiring() },
       { name: 'Engagement Sync Schedule', test: () => this.testEngagementSyncSchedule() },
-      { name: 'Growth Experiment Refresh Schedule', test: () => this.testGrowthExperimentRefreshSchedule() }
+      { name: 'Growth Experiment Refresh Schedule', test: () => this.testGrowthExperimentRefreshSchedule() },
+      { name: 'Language Consistency Detection', test: () => this.testLanguageConsistencyDetection() },
+      { name: 'Source Document Ingestion', test: () => this.testSourceDocumentIngestion() },
+      { name: 'Stage Arbiter Verdicts', test: () => this.testStageArbiterVerdicts() },
+      { name: 'Stage Arbiter Retry Loop', test: () => this.testStageArbiterRetryLoop() },
+      { name: 'Narration Excludes Structural Labels', test: () => this.testNarrationHasNoStructuralLabels() },
+      { name: 'Visual Briefs Track Script Content', test: () => this.testVisualBriefsTrackContent() }
     ];
 
     let passed = 0;
@@ -3288,6 +3294,324 @@ class SystemTest {
     }
     const noService = new DailyAutomation({}, {}, {});
     await noService.refreshGrowthExperiments();
+  }
+
+  /**
+   * The detector must flag English boilerplate embedded in French narration —
+   * the whole-document ratio it replaced could not see it.
+   */
+  async testLanguageConsistencyDetection() {
+    const { analyze, detect } = require('./utils/language-detector');
+
+    const mixed = [
+      'Bonjour à tous, bienvenue sur la chaîne !',
+      'Nous allons voir comment consulter vos contrats en ligne.',
+      'Section 1: The Benefits',
+      'Easy to get started and cost-effective solution with proven results.',
+      'Rendez-vous ensuite sur la page de connexion de votre banque.',
+    ].join('\n');
+
+    const mixedReport = analyze(mixed, 'fr');
+    if (mixedReport.consistent || mixedReport.offendingSegments.length < 2) {
+      throw new Error('Mixed-language narration was not detected');
+    }
+
+    const clean = [
+      'Bonjour à tous, bienvenue sur la chaîne !',
+      'Nous allons voir comment consulter vos contrats en ligne.',
+      'Rendez-vous sur la page de connexion puis saisissez votre identifiant.',
+      'Vous pouvez ensuite valider votre identité avec le code reçu par SMS.',
+    ].join('\n');
+
+    const cleanReport = analyze(clean, 'fr');
+    if (!cleanReport.consistent || cleanReport.offendingSegments.length !== 0) {
+      throw new Error('Clean French narration was wrongly flagged as mixed');
+    }
+
+    if (detect(clean) !== 'fr' || detect('The quick brown fox is running with them.') !== 'en') {
+      throw new Error('Language detection returned the wrong language');
+    }
+  }
+
+  /**
+   * Ingestion turns HTML into the outline the script must follow. Parsing runs
+   * against a stubbed HTTP client so the test stays offline and deterministic.
+   */
+  async testSourceDocumentIngestion() {
+    const { SourceIngestionService } = require('./utils/source-ingestion-service');
+
+    const html = `<!doctype html><html lang="fr"><head><title>Ignoré</title></head><body>
+      <nav>Menu à ignorer complètement</nav>
+      <h1>BPCE Assurances&nbsp;: mon espace</h1>
+      <p>Vous cherchez votre espace client pour consulter vos contrats d'assurance en ligne, et vous ne trouvez aucun portail dédié à votre nom.</p>
+      <h2>Trouver le bon espace pour mes contrats</h2>
+      <p>Les contrats se consultent depuis la rubrique Assurances de votre banque en ligne habituelle, et non depuis un site séparé.</p>
+      <h2>Déclarer un sinistre</h2>
+      <p>La déclaration se fait par téléphone ou depuis la rubrique dédiée de votre espace bancaire, selon le type de contrat concerné.</p>
+      <h2>Navigation</h2>
+      <footer>Mentions légales</footer></body></html>`;
+
+    const service = new SourceIngestionService({
+      captureScreenshots: false,
+      http: { get: async () => ({ data: html }) },
+      cacheDir: path.join(__dirname, 'temp', 'test-sources'),
+    });
+
+    const document = await service.ingest('https://example.test/guide');
+
+    if (document.title !== 'BPCE Assurances : mon espace') {
+      throw new Error(`Title extraction failed: got "${document.title}"`);
+    }
+    if (document.language !== 'fr') throw new Error('Declared page language was not honoured');
+
+    const headings = document.outline.map(entry => entry.text);
+    if (!headings.includes('Trouver le bon espace pour mes contrats') || !headings.includes('Déclarer un sinistre')) {
+      throw new Error(`Outline is missing chapters: ${JSON.stringify(headings)}`);
+    }
+    // "Navigation" carries no prose and must not become a video chapter.
+    if (headings.includes('Navigation')) {
+      throw new Error('Empty navigation heading leaked into the outline');
+    }
+    if (document.text.includes('Menu à ignorer')) {
+      throw new Error('Navigation chrome was not stripped from the extracted text');
+    }
+
+    const promptContext = SourceIngestionService.toPromptContext(document);
+    if (!promptContext.outline.length || promptContext.outline[0].order !== 1) {
+      throw new Error('Prompt context did not preserve the ordered outline');
+    }
+
+    const urls = SourceIngestionService.extractUrls('Voir https://example.test/guide, puis revenir.');
+    if (urls[0] !== 'https://example.test/guide') {
+      throw new Error(`URL extraction from free text failed: ${JSON.stringify(urls)}`);
+    }
+  }
+
+  /**
+   * Each arbiter must reject exactly the defects that shipped in the bad video:
+   * mixed language, repeated introduction, and a script ignoring its source.
+   */
+  async testStageArbiterVerdicts() {
+    const { StageArbiterService } = require('./utils/stage-arbiter-service');
+    const arbiter = new StageArbiterService();
+
+    const sourceDocument = {
+      title: 'BPCE Assurances : mon espace',
+      outline: [
+        { text: 'Trouver le bon espace pour mes contrats' },
+        { text: 'Déclarer un sinistre' },
+        { text: 'Identifier l\'entité qui porte mon contrat' },
+      ],
+    };
+    const context = { language: 'fr', lengthKey: 'medium', sourceDocument };
+
+    const repeatedLine = 'Aujourd\'hui nous allons voir en détail BPCE Assurances ensemble.';
+    const badScript = {
+      title: 'BPCE Assurances',
+      hook: { text: repeatedLine },
+      introduction: { greeting: 'Bonjour à tous !', topicIntro: repeatedLine, valueProposition: repeatedLine, credibility: '' },
+      mainContent: {
+        sections: [
+          { title: 'The Benefits', content: ['Easy to get started and cost-effective with proven results for everyone.'] },
+          { title: 'The Benefits', content: [repeatedLine] },
+        ],
+      },
+      conclusion: { recap: [repeatedLine], finalThought: 'Merci !' },
+      callToAction: { subscribe: 'Let me know in the comments what you think about this topic today.' },
+    };
+
+    const badVerdict = await arbiter.review('script', badScript, context);
+    const flagged = new Set(badVerdict.failures.map(check => check.id));
+    for (const expected of ['script_language', 'script_sections', 'script_not_repetitive', 'script_covers_source', 'script_distinct_titles']) {
+      if (!flagged.has(expected)) {
+        throw new Error(`Arbiter missed "${expected}"; flagged: ${[...flagged].join(', ')}`);
+      }
+    }
+    if (badVerdict.passed) throw new Error('Arbiter approved a defective script');
+
+    const feedback = arbiter.buildFeedback(badVerdict);
+    if (!feedback || !feedback.includes('Déclarer un sinistre')) {
+      throw new Error('Retry feedback does not name the uncovered source chapters');
+    }
+
+    // A raw URL as topic means source ingestion never resolved into a subject.
+    const urlStrategy = { topic: 'https://compteparticulier.com/mon-compte-bpce-assurances/', angle: 'guide' };
+    const strategyVerdict = await arbiter.review('strategy', urlStrategy, context);
+    if (!strategyVerdict.failures.some(check => check.id === 'strategy_topic_not_url')) {
+      throw new Error('Arbiter accepted a raw URL as the video topic');
+    }
+
+    // Placeholder imagery must never count as a produced visual.
+    const placeholderProduction = {
+      assets: { video: { visualAssets: [path.join(__dirname, 'data', 'assets', 'placeholder_1_0.png')] } },
+      script: { mainContent: { sections: [{ title: 'A' }, { title: 'B' }] } },
+    };
+    const productionVerdict = await arbiter.review('production', placeholderProduction, context);
+    if (!productionVerdict.failures.some(check => check.id === 'production_visuals_present')) {
+      throw new Error('Arbiter accepted placeholder imagery as real visual assets');
+    }
+  }
+
+  /**
+   * A recoverable rejection must re-run the stage with feedback, and a stage
+   * that never recovers must stop the run instead of shipping.
+   */
+  async testStageArbiterRetryLoop() {
+    const { StageArbiterService } = require('./utils/stage-arbiter-service');
+    const arbiter = new StageArbiterService({ maxAttempts: 3 });
+    const context = { language: 'fr', lengthKey: 'short' };
+
+    // Every sentence differs across sections: the arbiter rejects duplicated
+    // narration, so a valid fixture must not repeat itself either.
+    const goodSection = index => ({
+      title: `Étape ${index} pour accéder à votre espace`,
+      content: [
+        `Voici la démarche détaillée numéro ${index} que vous devez suivre avec attention.`,
+        `Ouvrez la rubrique numéro ${index} puis saisissez les identifiants correspondants.`,
+        `Validez enfin la demande numéro ${index} et consultez le résultat qui s'affiche.`,
+      ],
+    });
+    const acceptableScript = {
+      title: 'Accéder à mon espace assurance',
+      hook: { text: 'Vous cherchez votre espace client et vous ne le trouvez pas ?' },
+      introduction: { greeting: 'Bonjour à tous.', topicIntro: 'Voyons la marche à suivre.', valueProposition: 'Vous saurez où aller.', credibility: '' },
+      mainContent: { sections: [1, 2, 3, 4].map(goodSection) },
+      conclusion: { recap: ['Vous connaissez maintenant la démarche complète à suivre.'], finalThought: 'À bientôt.' },
+      callToAction: { subscribe: 'Abonnez-vous pour ne rien manquer des prochains guides.' },
+    };
+
+    let attempts = 0;
+    let feedbackSeen = null;
+    const result = await arbiter.enforce('script', feedback => {
+      attempts += 1;
+      feedbackSeen = feedback;
+      // First attempt reproduces the failure; the retry returns valid work.
+      if (attempts === 1) {
+        return { ...acceptableScript, mainContent: { sections: [{ title: 'Intro', content: ['Hello everyone and welcome back to the channel today.'] }] } };
+      }
+      return acceptableScript;
+    }, context);
+
+    if (attempts !== 2) throw new Error(`Expected exactly one retry, ran ${attempts} attempt(s)`);
+    if (!feedbackSeen || !feedbackSeen.includes('quality arbiter')) {
+      throw new Error('The retry did not receive the arbiter feedback');
+    }
+    if (result !== acceptableScript) throw new Error('The corrected script was not returned');
+    if (!result.arbiter?.passed) throw new Error('Verdict was not attached to the accepted artefact');
+
+    // A stage that keeps failing must raise, not quietly continue.
+    let raised = null;
+    try {
+      await arbiter.enforce('script', () => ({
+        ...acceptableScript,
+        mainContent: { sections: [{ title: 'Intro', content: ['Hello everyone and welcome back to the channel today.'] }] },
+      }), context);
+    } catch (error) {
+      raised = error;
+    }
+    if (!raised || raised.code !== 'STAGE_ARBITER_REJECTED') {
+      throw new Error('A persistently failing stage was allowed through');
+    }
+  }
+
+  /**
+   * Narration is what the viewer hears: it must contain no structural labels and
+   * no stage directions, in any language.
+   */
+  async testNarrationHasNoStructuralLabels() {
+    const { ProductionManagementAgent } = require('./agents/production-management-agent');
+    const { analyze } = require('./utils/language-detector');
+    const agent = Object.create(ProductionManagementAgent.prototype);
+
+    const narration = agent.formatScriptForTTS({
+      hook: { text: 'Vous cherchez votre espace client BPCE Assurances ?' },
+      introduction: {
+        greeting: 'Bonjour à tous et bienvenue.',
+        topicIntro: 'Voyons ensemble où consulter vos contrats.',
+        valueProposition: 'À la fin, vous saurez exactement où aller.',
+        credibility: 'Ce guide s\'appuie sur les portails officiels.',
+      },
+      mainContent: {
+        sections: [
+          { title: 'Trouver le bon espace', content: ['Vos contrats se consultent depuis la rubrique Assurances.', '[VISUELS: capture du portail]'] },
+          { title: 'Déclarer un sinistre', steps: [{ title: 'Ouvrir la rubrique', description: 'Connectez-vous à votre banque.', tip: 'Ayez votre numéro de contrat.' }] },
+          { title: 'Points bloquants', items: [{ number: 1, title: 'Contrat absent', description: 'Contactez votre conseiller.' }] },
+        ],
+      },
+      conclusion: { recap: ['Vous savez où trouver vos contrats.'], finalThought: 'À très vite.' },
+      callToAction: { subscribe: 'Abonnez-vous pour ne rien manquer.', like: 'Un pouce bleu aide la chaîne.', comment: 'Dites-moi en commentaire si cela a fonctionné.' },
+    });
+
+    if (/\bSection \d|\bNumber \d|\bStep \d/.test(narration)) {
+      throw new Error('English structural labels leaked into the narration');
+    }
+    if (narration.includes('[')) {
+      throw new Error('Stage directions leaked into the narration');
+    }
+    const report = analyze(narration, 'fr');
+    if (!report.consistent) {
+      throw new Error(`Narration is not consistently French: ${JSON.stringify(report.offendingSegments)}`);
+    }
+    if (!narration.includes('Ayez votre numéro de contrat')) {
+      throw new Error('Step guidance was dropped from the narration');
+    }
+  }
+
+  /**
+   * Visual briefs must describe each section's own subject, and instructional
+   * content must not be illustrated with decorative artwork.
+   */
+  async testVisualBriefsTrackContent() {
+    const { ProductionManagementAgent } = require('./agents/production-management-agent');
+    const { AIVideoGenerator } = require('./utils/ai-video-generator');
+    const agent = Object.create(ProductionManagementAgent.prototype);
+
+    const script = {
+      title: 'Accéder à mon espace BPCE Assurances',
+      hook: { text: 'Où trouver vos contrats en ligne ?' },
+      mainContent: {
+        sections: [
+          { title: 'Trouver le bon espace pour mes contrats', content: ['Passez par la rubrique Assurances de votre banque en ligne.'] },
+          { title: 'Déclarer un sinistre', content: ['La déclaration se fait depuis votre espace bancaire.'] },
+        ],
+      },
+    };
+
+    const briefs = agent.createVisualPromptsFromScript(script, {});
+    if (briefs.length !== 3) throw new Error(`Expected one brief per section plus the opener, got ${briefs.length}`);
+    if (briefs[0].style !== 'interface') {
+      throw new Error(`Account/portal content must use a realistic register, got "${briefs[0].style}"`);
+    }
+    if (!briefs[1].prompt.subject.includes('Trouver le bon espace')) {
+      throw new Error('Section brief does not describe its own section');
+    }
+    if (briefs[1].prompt.subject === briefs[2].prompt.subject) {
+      throw new Error('Sections received identical visual briefs');
+    }
+
+    const generator = Object.create(AIVideoGenerator.prototype);
+    const prompt = generator.enhanceVisualPrompt(briefs[1].prompt.subject, briefs[1].style);
+    if (/ethereal|mystical|dreamscape|cosmic/i.test(prompt)) {
+      throw new Error('Instructional content is still being rendered as decorative artwork');
+    }
+    if (!/screenshot|interface/i.test(prompt)) {
+      throw new Error('Interface style did not request a realistic screen depiction');
+    }
+
+    // Screenshots of the real page take priority over generated imagery.
+    const sourceDocument = {
+      screenshots: [
+        { path: '/tmp/page_top.png', label: 'Accueil', kind: 'hero' },
+        { path: '/tmp/section_00.png', label: 'Déclarer un sinistre', kind: 'section' },
+      ],
+    };
+    const matched = agent.matchScreenshotsToBriefs(briefs, sourceDocument);
+    if (matched.get(0) !== '/tmp/page_top.png') {
+      throw new Error('Hero screenshot was not used for the opening scene');
+    }
+    if (matched.get(2) !== '/tmp/section_00.png') {
+      throw new Error('Section screenshot was not matched to its narrated section');
+    }
   }
 }
 

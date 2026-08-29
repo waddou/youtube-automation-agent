@@ -27,6 +27,9 @@ const { AudienceEngagementService } = require('./utils/audience-engagement-servi
 const { GrowthExperimentService } = require('./utils/growth-experiment-service');
 const { AITextService } = require('./utils/ai-text-service');
 const { DiscoverabilityService } = require('./utils/discoverability-service');
+const { SourceIngestionService } = require('./utils/source-ingestion-service');
+const { StageArbiterService } = require('./utils/stage-arbiter-service');
+const { resolveLanguage } = require('./utils/i18n');
 const { version } = require('./package.json');
 const chalk = require('chalk');
 
@@ -235,8 +238,25 @@ class YouTubeAutomationAgent {
       topic: null,
       style: null,
       length: typeof body.length === 'string' ? body.length.toLowerCase() : 'medium',
-      strategyContext: null
+      strategyContext: null,
+      sourceUrl: null
     };
+
+    // A guide URL is the strongest possible brief: it fixes the subject, the
+    // structure and the facts. Accept it explicitly, and also recognise a link
+    // pasted into `topic`, which is what operators naturally do.
+    if (body.sourceUrl !== undefined && body.sourceUrl !== null) {
+      if (typeof body.sourceUrl !== 'string') {
+        return { valid: false, status: 400, error: 'sourceUrl must be a string' };
+      }
+      const sourceUrl = body.sourceUrl.trim();
+      if (sourceUrl) {
+        if (sourceUrl.length > 2000 || !SourceIngestionService.isValidUrl(sourceUrl)) {
+          return { valid: false, status: 400, error: 'sourceUrl must be a valid http(s) URL of 2000 characters or less' };
+        }
+        value.sourceUrl = sourceUrl;
+      }
+    }
 
     // JSON has no `undefined`, so clients send `null` to mean "no value provided".
     // Both are treated as "not set" here: topic/style are optional and default to
@@ -251,6 +271,11 @@ class YouTubeAutomationAgent {
         return { valid: false, status: 400, error: 'topic must be 200 characters or less' };
       }
       value.topic = topic || null;
+
+      if (!value.sourceUrl) {
+        const [pastedUrl] = SourceIngestionService.extractUrls(topic);
+        if (pastedUrl) value.sourceUrl = pastedUrl;
+      }
     }
 
     if (body.style !== undefined && body.style !== null) {
@@ -1309,7 +1334,8 @@ class YouTubeAutomationAgent {
       topic: job.topic,
       style: job.style,
       length: job.length || 'medium',
-      strategyContext: job.details?.strategyContext || {}
+      strategyContext: job.details?.strategyContext || {},
+      sourceUrl: job.details?.sourceUrl || null
     };
     const updated = await this.db.updateGenerationJob(job.id, {
       status: 'queued',
@@ -1360,7 +1386,8 @@ class YouTubeAutomationAgent {
       await this.db.updateGenerationJob(jobId, { status: 'running', progress: 2, error: null, completedAt: null });
       const result = await this.generateContent(input.topic, input.style, input.length, {
         jobId,
-        strategyContext: input.strategyContext
+        strategyContext: input.strategyContext,
+        sourceUrl: input.sourceUrl
       });
       await this.db.updateGenerationJob(jobId, {
         status: 'completed',
@@ -1408,73 +1435,91 @@ class YouTubeAutomationAgent {
 
   async generateContent(topic = null, style = null, length = 'medium', options = {}) {
     this.logger.info('Starting content generation pipeline...');
-    const { jobId = null, strategyContext = {} } = options;
+    const { jobId = null, strategyContext = {}, sourceUrl = null } = options;
     const profile = await this.db.getChannelProfile() || {};
     const lengthLabels = { short: '2-4 minutes', medium: '8-12 minutes', long: '15-20 minutes' };
+    const language = resolveLanguage(profile.language || process.env.DEFAULT_LANGUAGE);
+
+    // Step 0: Source ingestion. When the operator supplied a guide, read it
+    // before deciding anything — the guide, not the model's imagination, is what
+    // the video must deliver.
+    const sourceDocument = await this.ingestSourceDocument(sourceUrl, jobId);
+
+    const arbiterContext = {
+      language,
+      lengthKey: length,
+      sourceDocument,
+      contentType: style || profile.default_style || null,
+    };
+    const arbiter = this.getStageArbiter(jobId);
 
     // Step 1: Strategy
-    const strategy = await this.runGenerationStage(jobId, 'strategy', 10, async () => {
-      const generated = await this.agents.strategy.generateContentStrategy(topic);
-      if (!generated || typeof generated !== 'object') {
-        throw new Error('Strategy agent returned invalid result');
-      }
-      const contentStyles = new Set(['tutorial', 'explainer', 'list', 'review', 'story']);
-      const requestedStyle = style || profile.default_style || null;
-      if (requestedStyle && contentStyles.has(requestedStyle.toLowerCase())) {
-        generated.contentType = requestedStyle.charAt(0).toUpperCase() + requestedStyle.slice(1).toLowerCase();
-      }
-      generated.requestedStyle = requestedStyle;
-      generated.requestedLengthKey = length;
-      generated.requestedLength = lengthLabels[length] || lengthLabels.medium;
-      generated.angle = strategyContext.angle || generated.angle;
-      generated.planRationale = strategyContext.rationale || null;
-      generated.targetAudience = strategyContext.audience || profile.target_audience || generated.targetAudience;
-      generated.brandVoice = profile.brand_voice || null;
-      generated.channelGoal = strategyContext.objective || profile.goal || null;
-      generated.channelValueProposition = strategyContext.valueProposition || null;
-      generated.channelConstraints = strategyContext.constraints || null;
-      generated.contentPillar = strategyContext.pillar || null;
-      generated.callToAction = profile.call_to_action || null;
-      generated.researchSources = Array.isArray(strategyContext.researchSources)
-        ? strategyContext.researchSources
-        : [];
-      return generated;
-    });
+    const strategy = await this.runGenerationStage(jobId, 'strategy', 10, () =>
+      arbiter.enforce('strategy', async () => {
+        const generated = await this.agents.strategy.generateContentStrategy(
+          topic || sourceDocument?.title || null
+        );
+        if (!generated || typeof generated !== 'object') {
+          throw new Error('Strategy agent returned invalid result');
+        }
+        const contentStyles = new Set(['tutorial', 'explainer', 'list', 'review', 'story']);
+        const requestedStyle = style || profile.default_style || null;
+        if (requestedStyle && contentStyles.has(requestedStyle.toLowerCase())) {
+          generated.contentType = requestedStyle.charAt(0).toUpperCase() + requestedStyle.slice(1).toLowerCase();
+        }
+        generated.requestedStyle = requestedStyle;
+        generated.requestedLengthKey = length;
+        generated.requestedLength = lengthLabels[length] || lengthLabels.medium;
+        generated.angle = strategyContext.angle || generated.angle;
+        generated.planRationale = strategyContext.rationale || null;
+        generated.targetAudience = strategyContext.audience || profile.target_audience || generated.targetAudience;
+        generated.brandVoice = profile.brand_voice || null;
+        generated.channelGoal = strategyContext.objective || profile.goal || null;
+        generated.channelValueProposition = strategyContext.valueProposition || null;
+        generated.channelConstraints = strategyContext.constraints || null;
+        generated.contentPillar = strategyContext.pillar || null;
+        generated.callToAction = profile.call_to_action || null;
+        generated.language = language;
+        generated.sourceDocument = sourceDocument;
+        generated.researchSources = this.mergeResearchSources(strategyContext.researchSources, sourceDocument);
+
+        if (sourceDocument) {
+          // The guide defines the subject; a model-invented topic would send the
+          // rest of the pipeline somewhere else entirely.
+          generated.topic = sourceDocument.title || generated.topic;
+          generated.contentType = generated.contentType || 'Tutorial';
+        }
+        return generated;
+      }, arbiterContext)
+    );
     this.logger.info(`Strategy generated: ${strategy.topic}`);
 
     // Step 2: Script Writing
-    const script = await this.runGenerationStage(
-      jobId,
-      'script',
-      25,
-      () => this.agents.scriptWriter.generateScript(strategy)
+    const script = await this.runGenerationStage(jobId, 'script', 25, () =>
+      arbiter.enforce('script', feedback =>
+        this.agents.scriptWriter.generateScript(strategy, { arbiterFeedback: feedback, sourceDocument }),
+        arbiterContext)
     );
     this.logger.info(`Script generated: ${script.title}`);
 
     // Step 3: Thumbnail Design
-    const thumbnail = await this.runGenerationStage(
-      jobId,
-      'thumbnail',
-      40,
-      () => this.agents.thumbnailDesigner.generateThumbnail(script)
+    const thumbnail = await this.runGenerationStage(jobId, 'thumbnail', 40, () =>
+      arbiter.enforce('thumbnail', () => this.agents.thumbnailDesigner.generateThumbnail(script), arbiterContext)
     );
     this.logger.info('Thumbnail generated');
 
     // Step 4: SEO Optimization
-    const seoData = await this.runGenerationStage(
-      jobId,
-      'seo',
-      52,
-      () => this.agents.seoOptimizer.optimize(script, strategy)
+    const seoData = await this.runGenerationStage(jobId, 'seo', 52, () =>
+      arbiter.enforce('seo', () => this.agents.seoOptimizer.optimize(script, strategy), arbiterContext)
     );
     this.logger.info('SEO optimization complete');
 
     // Step 5: Production Management
-    const productionData = await this.runGenerationStage(
-      jobId,
-      'production',
-      62,
-      () => this.agents.production.processContent({ strategy, script, thumbnail, seo: seoData, jobId })
+    const productionData = await this.runGenerationStage(jobId, 'production', 62, () =>
+      arbiter.enforce('production', () =>
+        this.agents.production.processContent({
+          strategy, script, thumbnail, seo: seoData, jobId, sourceDocument
+        }), arbiterContext)
     );
     this.logger.info('Production processing complete');
 
@@ -1534,6 +1579,80 @@ class YouTubeAutomationAgent {
         scheduledFor: scheduleEntry ? scheduleEntry.publishTime : null
       };
     });
+  }
+
+  /**
+   * Fetch and structure the operator-supplied guide.
+   *
+   * Ingestion failing must not sink the run: the pipeline falls back to
+   * unsourced generation, but records why, because "the video ignored my guide"
+   * is otherwise indistinguishable from "the guide could not be read".
+   */
+  async ingestSourceDocument(sourceUrl, jobId) {
+    if (!sourceUrl) return null;
+
+    if (!this.sourceIngestion) {
+      this.sourceIngestion = new SourceIngestionService({ logger: this.logger });
+    }
+
+    try {
+      await this.updateJobStage(jobId, 'source_ingestion', 5, { sourceUrl });
+      const document = await this.sourceIngestion.ingest(sourceUrl);
+      this.logger.info(
+        `Source guide ingested: "${document.title}" (${document.outline.length} chapters, ${document.screenshots.length} screenshots)`
+      );
+      return document;
+    } catch (error) {
+      this.logger.error(`Source ingestion failed for ${sourceUrl}: ${error.message}`);
+      await this.operator.notify({
+        type: 'source_ingestion_failed',
+        level: 'warning',
+        title: 'Source guide could not be read',
+        message: `${sourceUrl}: ${error.message}`,
+        data: { jobId, sourceUrl }
+      }).catch(() => {});
+      return null;
+    }
+  }
+
+  getStageArbiter(jobId) {
+    if (!this.stageArbiter) {
+      this.stageArbiter = new StageArbiterService({
+        logger: this.logger,
+        onVerdict: async ({ stage, attempt, verdict }) => {
+          if (verdict.passed) return;
+          // Surface rejections as they happen so an operator watching a run sees
+          // which stage is struggling and why, rather than a late generic failure.
+          await this.operator.notify({
+            type: 'stage_arbiter_rejection',
+            level: verdict.failures.some(check => check.blocking) ? 'warning' : 'info',
+            title: `Arbiter flagged the ${stage} stage`,
+            message: verdict.failures.map(check => check.message).join(' | ').slice(0, 500),
+            data: { jobId, stage, attempt, failures: verdict.failures.map(check => check.id) }
+          }).catch(() => {});
+        }
+      });
+    }
+    return this.stageArbiter;
+  }
+
+  /**
+   * The ingested guide is itself a citable source, so claims drawn from it can
+   * be traced back by the provenance service.
+   */
+  mergeResearchSources(contextSources, sourceDocument) {
+    const sources = Array.isArray(contextSources) ? [...contextSources] : [];
+    if (sourceDocument?.url && !sources.some(source => source.url === sourceDocument.url)) {
+      sources.unshift({
+        url: sourceDocument.url,
+        title: sourceDocument.title || sourceDocument.url,
+        publisher: (() => {
+          try { return new URL(sourceDocument.url).hostname; } catch (_error) { return null; }
+        })(),
+        retrievedAt: sourceDocument.fetchedAt,
+      });
+    }
+    return sources;
   }
 
   async runGenerationStage(jobId, stage, progress, producer) {

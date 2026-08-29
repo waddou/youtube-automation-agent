@@ -963,6 +963,9 @@ class Database {
     const id = this.generateId('job');
     const details = {
       strategyContext: input.strategyContext || {},
+      // Kept in details rather than a dedicated column so existing databases
+      // need no migration; a resumed job must still know which guide it adapts.
+      sourceUrl: input.sourceUrl || null,
       resumeCount: 0,
       reusedStages: []
     };

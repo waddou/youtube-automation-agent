@@ -90,3 +90,4 @@ data/thumbnails/
 
 # Claude worktrees
 .claude/worktrees/
+data/sources/

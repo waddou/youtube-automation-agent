@@ -1,6 +1,10 @@
 const fs = require('fs').promises;
 const axios = require('axios');
 const { Logger } = require('./logger');
+const { analyze } = require('./language-detector');
+const { resolveLanguage } = require('./i18n');
+const { LENGTH_TARGETS, WORDS_PER_MINUTE } = require('./stage-arbiter-service');
+
 
 class OperatorService {
   constructor(db) {
@@ -155,83 +159,57 @@ class OperatorService {
     };
   }
 
-  checkLanguageConsistency(script, production) {
-    const language = process.env.DEFAULT_LANGUAGE || 'fr';
-    const isFrench = language === 'fr';
-    
-    if (isFrench) {
-      // Count French words vs English words
-      const frenchWords = (script.match(/\b(le|la|les|un|une|des|du|de|et|ou|mais|donc|car|que|qui|ce|cette|ces|mon|ma|mes|ton|ta|tes|son|sa|ses|notre|votre|leur|leurs|je|tu|il|elle|nous|vous|ils|elles|est|sont|ai|as|a|avons|avez|ont|être|avoir|faire|aller|venir|voir|savoir|pouvoir|vouloir|devoir|falloir)\b/gi) || []).length;
-      const englishWords = (script.match(/\b(the|and|or|but|so|because|that|this|these|those|my|your|his|her|its|our|their|i|you|he|she|we|they|is|are|am|have|has|had|do|does|did|will|would|could|should|may|might|must|can|shall)\b/gi) || []).length;
-      
-      // If more than 10% English words in French content, flag it
-      const totalWords = script.split(/\s+/).length;
-      const englishRatio = englishWords / Math.max(totalWords, 1);
-      
-      return englishRatio < 0.1;
-    }
-    
-    // For English, just check it's not mostly French
-    return true;
+  /**
+   * Final-gate quality checks.
+   *
+   * These duplicate what the per-stage arbiters already enforce, and exist as a
+   * last line of defence for productions that reached review by another route
+   * (a resumed job reusing old checkpoints, an imported production). They
+   * delegate to the shared implementations so the two layers cannot drift apart
+   * and disagree about the same artefact.
+   */
+  checkLanguageConsistency(script, _production) {
+    const language = resolveLanguage(process.env.DEFAULT_LANGUAGE);
+    return analyze(String(script || ''), language).consistent;
   }
 
   checkScriptStructure(script) {
-    // Check for repetitive patterns - same phrases repeated
-    const sentences = script.split(/[.!?]+/).filter(s => s.trim().length > 20);
-    if (sentences.length < 5) return true; // Not enough to check
-    
-    // Check for duplicate sentences (or very similar)
-    const uniqueSentences = new Set(sentences.map(s => s.trim().toLowerCase()));
-    const duplicateRatio = 1 - (uniqueSentences.size / sentences.length);
-    
-    // Check for repetitive intro patterns
-    const introPatterns = [
-      /today.{0,30}diving.{0,30}deep/i,
-      /by the end.{0,30}you.{0,30}understand/i,
-      /welcome back.{0,30}channel/i
-    ];
-    
-    let introCount = 0;
-    for (const pattern of introPatterns) {
-      const matches = script.match(pattern);
-      if (matches && matches.length > 1) introCount += matches.length - 1;
-    }
-    
-    return duplicateRatio < 0.3 && introCount < 2;
+    const sentences = String(script || '')
+      .split(/[.!?\n]+/)
+      .map(sentence => sentence.trim().toLowerCase())
+      .filter(sentence => sentence.length > 25);
+    if (sentences.length < 5) return true;
+
+    const seen = new Map();
+    for (const sentence of sentences) seen.set(sentence, (seen.get(sentence) || 0) + 1);
+    const duplicates = [...seen.values()].reduce((total, count) => total + count - 1, 0);
+    return duplicates / sentences.length <= 0.3;
   }
 
   checkWordCount(script, requestedLength) {
-    const wordCount = script.split(/\s+/).length;
-    const targets = {
-      'short': { min: 800, max: 1500 },
-      'medium': { min: 1500, max: 3000 },
-      'long': { min: 3000, max: 5000 }
-    };
-    const target = targets[requestedLength] || targets.medium;
-    return wordCount >= target.min && wordCount <= target.max;
+    const words = String(script || '').split(/\s+/).filter(Boolean).length;
+    const target = LENGTH_TARGETS[requestedLength] || LENGTH_TARGETS.medium;
+    return (
+      words >= target.minMinutes * WORDS_PER_MINUTE &&
+      words <= target.maxMinutes * WORDS_PER_MINUTE
+    );
   }
 
   checkImageQuality(assets) {
     if (!assets) return false;
-    
-    const thumbnail = assets.thumbnail;
-    const video = assets.finalVideo;
-    
-    // Check thumbnail is actual image file
-    if (thumbnail?.path) {
-      const isInfoFile = thumbnail.path.endsWith('.info');
-      const isSimulated = thumbnail.path.includes('sim_') || thumbnail.path.includes('.info');
-      if (isInfoFile || isSimulated) return false;
+
+    const isPlaceholder = value => {
+      const target = String(value || '');
+      if (!target) return false;
+      return target.endsWith('.info') || /placeholder_/.test(target) || /_sim_/.test(target);
+    };
+
+    if (isPlaceholder(assets.thumbnail?.path)) return false;
+
+    for (const asset of assets.video?.visualAssets || []) {
+      if (isPlaceholder(typeof asset === 'string' ? asset : asset?.path)) return false;
     }
-    
-    // Check video assets
-    if (video?.visualAssets) {
-      for (const asset of video.visualAssets) {
-        if (asset.endsWith('.info')) return false;
-        if (asset.includes('sim_')) return false;
-      }
-    }
-    
+
     return true;
   }
 

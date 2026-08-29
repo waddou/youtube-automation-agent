@@ -191,15 +191,22 @@ class AIVideoGenerator {
     return outputPath;
   }
 
-  async generateVisualAssets(prompt, style = "ethereal", count = 1) {
-    this.logger.info(`Generating ${count} visual assets with style: ${style}`);
+  /**
+   * @param {string|{subject: string, style?: string}} brief - what the image
+   *   must show. Callers pass a structured brief so the subject stays separate
+   *   from the stylistic treatment.
+   */
+  async generateVisualAssets(brief, style = "documentary", count = 1) {
+    const subject = typeof brief === 'object' && brief !== null ? brief.subject : brief;
+    const resolvedStyle = (typeof brief === 'object' && brief?.style) || style;
+    this.logger.info(`Generating ${count} visual assets with style: ${resolvedStyle}`);
 
     try {
       if (!this.openai && !this.gemini) {
-        return await this.simulateVisualAssets(prompt, style, count);
+        return await this.simulateVisualAssets(subject, resolvedStyle, count);
       }
 
-      const enhancedPrompt = this.enhanceVisualPrompt(prompt, style);
+      const enhancedPrompt = this.enhanceVisualPrompt(subject, resolvedStyle);
       const localPaths = [];
 
       for (let i = 0; i < count; i++) {
@@ -212,7 +219,7 @@ class AIVideoGenerator {
       return localPaths;
     } catch (error) {
       this.logger.error('Visual asset generation failed:', error);
-      return await this.simulateVisualAssets(prompt, style, count);
+      return await this.simulateVisualAssets(subject, resolvedStyle, count);
     }
   }
 
@@ -294,15 +301,52 @@ class AIVideoGenerator {
 
   enhanceVisualPrompt(prompt, style) {
     const styleEnhancements = {
-      ethereal: "ethereal, dreamy, mystical, soft lighting, floating particles, cosmic background",
-      modern: "modern, clean, minimalist, professional, sleek design, contemporary",
-      animated: "animated style, cartoon, vibrant colors, expressive, dynamic",
-      cinematic: "cinematic lighting, dramatic, movie poster style, high contrast",
-      abstract: "abstract art, geometric shapes, gradient colors, artistic composition"
+      // Instructional content about a website, app or account: show the thing
+      // itself. This is the default whenever a source page drives the video.
+      interface: {
+        treatment:
+          'photorealistic screenshot-style depiction of a web interface on a desktop screen, ' +
+          'realistic browser chrome, clean readable UI panels, plausible French-language labels, ' +
+          'neutral office lighting, no fantasy elements',
+        medium: 'high-resolution product screenshot, 16:9',
+      },
+      documentary: {
+        treatment:
+          'realistic documentary photography, natural lighting, authentic everyday setting, ' +
+          'shallow depth of field, no text overlays',
+        medium: 'high-quality photograph, 16:9',
+      },
+      ethereal: {
+        treatment: 'ethereal, dreamy, mystical, soft lighting, floating particles, cosmic background',
+        medium: 'digital art, 16:9',
+      },
+      modern: {
+        treatment: 'modern, clean, minimalist, professional, sleek design, contemporary',
+        medium: 'digital art, 16:9',
+      },
+      animated: {
+        treatment: 'animated style, cartoon, vibrant colors, expressive, dynamic',
+        medium: 'illustration, 16:9',
+      },
+      cinematic: {
+        treatment: 'cinematic lighting, dramatic, high contrast, filmic color grading',
+        medium: 'cinematic still, 16:9',
+      },
+      abstract: {
+        treatment: 'abstract art, geometric shapes, gradient colors, artistic composition',
+        medium: 'digital art, 16:9',
+      },
     };
 
-    const enhancement = styleEnhancements[style] || styleEnhancements.ethereal;
-    return `${prompt}, ${enhancement}, high quality, 16:9 aspect ratio, digital art`;
+    const enhancement = styleEnhancements[style] || styleEnhancements.documentary;
+    return [
+      `Subject: ${prompt}`,
+      `Treatment: ${enhancement.treatment}`,
+      `Format: ${enhancement.medium}, high quality`,
+      // Rendered words in AI imagery are unreliable and, in a localised video,
+      // routinely come out in the wrong language.
+      'Do not render paragraphs of text, captions, watermarks or logos.',
+    ].join('. ');
   }
 
   async downloadImage(url, outputPath) {
@@ -926,64 +970,90 @@ class AIVideoGenerator {
     return infoPath;
   }
 
+  /**
+   * Last-resort stand-in when no image provider is reachable.
+   *
+   * Two properties matter here. The file is named `placeholder_*` so the stage
+   * arbiter can tell it apart from real imagery and refuse to ship it — the
+   * previous version was indistinguishable from a generated asset and sailed
+   * through every check. And it renders the section's own wording rather than a
+   * truncated English prompt dump, so a placeholder that does reach a preview
+   * still reads in the video's language.
+   */
   async simulateVisualAssets(prompt, style, count) {
-    this.logger.info(`Simulating ${count} visual assets...`);
-    
+    this.logger.warn(`No image provider available — writing ${count} placeholder visual(s)`);
+
     const { createCanvas } = require('canvas');
-    
+    const subject = String(prompt || '').replace(/\s+/g, ' ').trim();
+
+    const palettes = {
+      interface: ['#0f172a', '#1e293b'],
+      documentary: ['#1c1917', '#292524'],
+      ethereal: ['#1a1a2e', '#0f0f23'],
+      modern: ['#f8fafc', '#e2e8f0'],
+    };
+    const [from, to] = palettes[style] || palettes.documentary;
+    const onLight = style === 'modern';
+
     const paths = [];
     for (let i = 0; i < count; i++) {
-      const assetPath = path.join(__dirname, '..', 'data', 'assets', `visual_${Date.now()}_${i}.png`);
-      
+      const assetPath = path.join(
+        __dirname, '..', 'data', 'assets', `placeholder_${Date.now()}_${i}.png`
+      );
       await fs.mkdir(path.dirname(assetPath), { recursive: true });
-      
-      // Create a canvas with gradient and text
+
       const canvas = createCanvas(1920, 1080);
       const ctx = canvas.getContext('2d');
-      
-      // Gradient background
+
       const gradient = ctx.createLinearGradient(0, 0, 1920, 1080);
-      if (style === 'ethereal') {
-        gradient.addColorStop(0, '#1a1a2e');
-        gradient.addColorStop(0.5, '#16213e');
-        gradient.addColorStop(1, '#0f0f23');
-      } else if (style === 'modern') {
-        gradient.addColorStop(0, '#ffffff');
-        gradient.addColorStop(1, '#f0f0f0');
-      } else {
-        gradient.addColorStop(0, '#667eea');
-        gradient.addColorStop(1, '#764ba2');
-      }
+      gradient.addColorStop(0, from);
+      gradient.addColorStop(1, to);
       ctx.fillStyle = gradient;
       ctx.fillRect(0, 0, 1920, 1080);
-      
-      // Add decorative elements
-      ctx.fillStyle = 'rgba(255,255,255,0.05)';
-      for (let x = 0; x < 1920; x += 100) {
-        for (let y = 0; y < 1080; y += 100) {
-          ctx.beginPath();
-          ctx.arc(x, y, 2, 0, Math.PI * 2);
-          ctx.fill();
-        }
-      }
-      
-      // Add text
-      ctx.fillStyle = 'rgba(255,255,255,0.9)';
-      ctx.font = 'bold 64px Arial';
+
+      ctx.fillStyle = onLight ? 'rgba(15,23,42,0.92)' : 'rgba(255,255,255,0.92)';
       ctx.textAlign = 'center';
-      ctx.fillText(prompt.substring(0, 80), 960, 480);
-      
-      ctx.font = '32px Arial';
-      ctx.fillStyle = 'rgba(255,255,255,0.6)';
-      ctx.fillText(`Style: ${style} | Scene ${i + 1}`, 960, 560);
-      
+      ctx.font = 'bold 58px Arial';
+      this.wrapCanvasText(ctx, subject, 960, 470, 1560, 74, 4);
+
+      paths.push(assetPath);
       const buffer = canvas.toBuffer('image/png');
       await fs.writeFile(assetPath, buffer);
-      
-      paths.push(assetPath);
     }
     
     return paths;
+  }
+
+  /**
+   * Draw centred, word-wrapped text. Long French section titles overflowed a
+   * single `fillText` call and were silently clipped mid-word.
+   */
+  wrapCanvasText(ctx, text, centerX, startY, maxWidth, lineHeight, maxLines) {
+    const words = String(text).split(/\s+/).filter(Boolean);
+    if (!words.length) return;
+
+    const lines = [];
+    let current = '';
+    for (const word of words) {
+      const candidate = current ? `${current} ${word}` : word;
+      if (ctx.measureText(candidate).width > maxWidth && current) {
+        lines.push(current);
+        current = word;
+        if (lines.length === maxLines) break;
+      } else {
+        current = candidate;
+      }
+    }
+    if (lines.length < maxLines && current) lines.push(current);
+    if (lines.length === maxLines && words.join(' ') !== lines.join(' ')) {
+      lines[maxLines - 1] = `${lines[maxLines - 1].replace(/[\s,;:]+$/, '')}…`;
+    }
+
+    // Keep the block vertically centred on the requested anchor.
+    const offset = ((lines.length - 1) * lineHeight) / 2;
+    lines.forEach((line, index) => {
+      ctx.fillText(line, centerX, startY - offset + index * lineHeight);
+    });
   }
 
   async simulateVideoGeneration(script, visualAssets, audioPath, outputPath) {
