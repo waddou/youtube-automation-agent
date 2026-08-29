@@ -63,15 +63,18 @@ class SourceIngestionService {
     }
 
     this.logger.info(`Ingesting source document: ${url}`);
-    const html = await this.fetchHtml(url);
-    const document = this.parseDocument(html, url);
+    const fetched = await this.fetchHtml(url);
+    // Downstream work (screenshots, citations) must use the URL that answered,
+    // not the one originally requested.
+    const resolvedUrl = fetched.url;
+    const document = this.parseDocument(fetched.html, resolvedUrl);
 
     if (!document.outline.length && document.text.length < 200) {
       throw new Error(`Source document has no usable content: ${url}`);
     }
 
     if (this.captureScreenshots && options.screenshots !== false) {
-      document.screenshots = await this.capturePageScreenshots(url, document, options);
+      document.screenshots = await this.capturePageScreenshots(resolvedUrl, document, options);
     } else {
       document.screenshots = [];
     }
@@ -84,6 +87,34 @@ class SourceIngestionService {
   }
 
   async fetchHtml(url) {
+    try {
+      return { html: await this.requestHtml(url), url };
+    } catch (error) {
+      // Hosts are normalised without "www." for counting purposes, but plenty of
+      // sites only answer on the www subdomain — the bare name does not resolve
+      // at all. Retry across the www boundary before giving up.
+      const alternate = this.toggleWww(url);
+      if (alternate && /ENOTFOUND|EAI_AGAIN|ECONNREFUSED/.test(error.code || error.message || '')) {
+        this.logger.info(`${url} did not resolve; retrying as ${alternate}`);
+        return { html: await this.requestHtml(alternate), url: alternate };
+      }
+      throw error;
+    }
+  }
+
+  toggleWww(url) {
+    try {
+      const parsed = new URL(url);
+      parsed.hostname = parsed.hostname.startsWith('www.')
+        ? parsed.hostname.slice(4)
+        : `www.${parsed.hostname}`;
+      return parsed.toString();
+    } catch (_error) {
+      return null;
+    }
+  }
+
+  async requestHtml(url) {
     const response = await this.http.get(url, {
       timeout: this.timeout,
       maxContentLength: MAX_HTML_BYTES,
@@ -126,8 +157,66 @@ class SourceIngestionService {
       outline,
       text,
       wordCount: text.split(/\s+/).filter(Boolean).length,
+      // The site the guide is *about*, which is what the visuals must show.
+      subjectUrl: this.detectSubjectUrl(html, url),
       screenshots: [],
     };
+  }
+
+  /**
+   * Find the official site a how-to guide describes.
+   *
+   * A guide and its subject are two different things: an article explaining how
+   * to reach an insurer's customer area is not that customer area. Illustrating
+   * the video with screenshots of the guide shows the reader the instructions
+   * instead of the interface they must operate — the visuals end up picturing
+   * the wrong website entirely.
+   *
+   * The subject is inferred from the outbound links: a guide about one service
+   * links to it repeatedly, and to little else.
+   */
+  detectSubjectUrl(html, guideUrl) {
+    let guideHost = '';
+    try {
+      guideHost = new URL(guideUrl).hostname.replace(/^www\./, '');
+    } catch (_error) {
+      return null;
+    }
+
+    const counts = new Map();
+    const noise = /(facebook|twitter|linkedin|instagram|youtube|tiktok|google|gstatic|googleapis|cloudflare|gravatar|schema|w3|wordpress|jsdelivr|unpkg|gmail|apple|microsoft)\./i;
+
+    const record = host => {
+      if (!host) return;
+      const clean = host.replace(/^www\./, '').toLowerCase();
+      if (clean === guideHost || clean.endsWith(`.${guideHost}`)) return;
+      if (noise.test(clean)) return;
+      counts.set(clean, (counts.get(clean) || 0) + 1);
+    };
+
+    for (const match of html.matchAll(/href=["'](https?:\/\/[^"']+)["']/gi)) {
+      try {
+        record(new URL(match[1]).hostname);
+      } catch (_error) { /* malformed href */ }
+    }
+
+    // Security-conscious guides deliberately mention the official address as
+    // plain text instead of linking it, so readers type it themselves. Those
+    // mentions are the strongest signal available and must be counted too.
+    const text = this.htmlToText(this.stripNonContent(html));
+    for (const match of text.matchAll(/\b((?:[a-z0-9-]+\.)+[a-z]{2,})\b/gi)) {
+      const candidate = match[1].toLowerCase();
+      if (!/\.(com|fr|net|org|eu|be|ch|ca|io)$/.test(candidate)) continue;
+      // Skip file names such as "image.png" or version strings.
+      if (/\.(png|jpe?g|gif|svg|webp|css|js|json|pdf)$/.test(candidate)) continue;
+      record(candidate);
+    }
+
+    const ranked = [...counts.entries()].sort((a, b) => b[1] - a[1]);
+    const best = ranked[0];
+    // A single stray mention proves nothing; require the domain to recur.
+    if (!best || best[1] < 2) return null;
+    return `https://${best[0]}/`;
   }
 
   stripNonContent(html) {

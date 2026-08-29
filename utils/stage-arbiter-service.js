@@ -29,10 +29,13 @@ const DEFAULT_MAX_ATTEMPTS = Number(process.env.STAGE_ARBITER_MAX_ATTEMPTS || 2)
 // wide because pacing varies with content type.
 const WORDS_PER_MINUTE = 150;
 
+// Aligned with ScriptWriterAgent's word budgets. These bounds intentionally
+// allow short videos: a guide whose answer is one fact does not need ten
+// minutes, and the arbiter must not push writers to pad.
 const LENGTH_TARGETS = {
-  short: { minMinutes: 2, maxMinutes: 5 },
-  medium: { minMinutes: 6, maxMinutes: 14 },
-  long: { minMinutes: 13, maxMinutes: 24 },
+  short: { minMinutes: 1.5, maxMinutes: 4 },
+  medium: { minMinutes: 3.5, maxMinutes: 8 },
+  long: { minMinutes: 7, maxMinutes: 14 },
 };
 
 class StageArbiterService {
@@ -308,10 +311,13 @@ class StageArbiterService {
     if (context.sourceDocument?.outline?.length) {
       const coverage = this.sourceCoverage(script, context.sourceDocument);
       checks.push(
-        this.check('script_covers_source', coverage.ratio >= 0.6,
+        // A video synthesises its source rather than reciting it, so full
+        // coverage is not the goal — only that the script is genuinely about
+        // the supplied guide and not a loosely related essay.
+        this.check('script_covers_source', coverage.ratio >= 0.3,
           `Script only covers ${Math.round(coverage.ratio * 100)}% of the source guide's outline`, {
             guidance:
-              'Build one section per chapter of the supplied guide, following its table of contents in order.',
+              'Ground the script in the supplied guide: the topics you cover must come from it.',
             evidence: { missing: coverage.missing.slice(0, 6) },
           })
       );

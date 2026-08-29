@@ -3,14 +3,19 @@ const { AITextService } = require('../utils/ai-text-service');
 const { resolveLanguage, label, promptLanguageDirective } = require('../utils/i18n');
 const { SourceIngestionService } = require('../utils/source-ingestion-service');
 
-// Spoken-word budget per requested video length. The AI stage previously asked
-// for a 8-12 minute script but capped the response at 1800 tokens, so the JSON
-// was truncated, parsing failed, and the run silently fell back to the generic
-// English template — which is why finished videos were an introduction on loop.
+// Spoken-word budget per requested video length. The AI stage once asked for an
+// 8-12 minute script while capping the response at 1800 tokens, so the JSON was
+// truncated, parsing failed, and the run silently fell back to a generic English
+// template — finished videos were an introduction on loop.
+//
+// Budgets are deliberately tighter than the written guides they adapt. A
+// reader skims and jumps to their case; a viewer watches linearly and leaves.
+// Reciting an exhaustive guide chapter by chapter produced a nine-minute video
+// where the actual answer arrived in the first thirty seconds.
 const LENGTH_BUDGETS = {
-  short: { words: 550, maxTokens: 3000, sections: 3 },
-  medium: { words: 1500, maxTokens: 7000, sections: 6 },
-  long: { words: 2600, maxTokens: 12000, sections: 9 },
+  short: { words: 350, maxTokens: 2500, sections: 3 },
+  medium: { words: 800, maxTokens: 5000, sections: 4 },
+  long: { words: 1500, maxTokens: 8000, sections: 6 },
 };
 
 class ScriptWriterAgent {
@@ -224,9 +229,10 @@ class ScriptWriterAgent {
    */
   buildLengthDirective(budget) {
     return (
-      `Write approximately ${budget.words} words of spoken narration in total, ` +
-      `spread across at least ${budget.sections} substantive sections. ` +
-      'The "content" array of each section must contain full spoken sentences, not bullet keywords.'
+      `Write about ${budget.words} words of spoken narration in total — this is a ceiling, not a target to pad towards. ` +
+      `Use at most ${budget.sections} sections; fewer is better if the subject allows. ` +
+      'Each section\'s "content" array holds full spoken sentences, not bullet keywords. ' +
+      'Cut anything a viewer would skip.'
     );
   }
 
@@ -245,17 +251,21 @@ class ScriptWriterAgent {
 
     return [
       '',
-      'SOURCE GUIDE — this script is an adaptation of the following document.',
+      'SOURCE GUIDE — this script adapts the following document.',
       `Source title: ${context.title}`,
       `Source URL: ${context.url}`,
-      'Its table of contents is the required structure of the video:',
+      'Its chapters, for reference:',
       outline,
       '',
       'Rules for using the source guide:',
-      '- Create one script section per numbered chapter above, in the same order.',
-      '- Base each section on that chapter\'s actual content; do not invent facts absent from it.',
-      '- Open by announcing what the video will cover (the table of contents), then deliver it.',
-      '- Do not pad with generic advice: everything must trace back to the source guide.',
+      // A written guide is exhaustive because readers skim and jump to their
+      // case. A viewer watches linearly and leaves: mirroring every chapter
+      // produces a long, flat video that buries the answer.
+      '- Do NOT mirror the chapter list. Select only what a viewer genuinely needs, and merge related chapters.',
+      '- Lead with the answer. If the guide\'s core message is a single fact, state it in the first thirty seconds.',
+      '- Treat edge cases, exceptions and background theory as optional: include one only if most viewers hit it.',
+      '- Base every statement on the guide\'s actual content; do not invent facts absent from it.',
+      '- Be concise. Prefer a short video that answers the question over a complete one that recites the guide.',
       '',
     ].join('\n');
   }

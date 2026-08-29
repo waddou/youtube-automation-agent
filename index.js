@@ -1447,7 +1447,7 @@ class YouTubeAutomationAgent {
     // Step 0: Source ingestion. When the operator supplied a guide, read it
     // before deciding anything — the guide, not the model's imagination, is what
     // the video must deliver.
-    const sourceDocument = await this.ingestSourceDocument(sourceUrl, jobId);
+    const sourceDocument = await this.ingestSourceDocument(sourceUrl, jobId, options.subjectUrl || null);
 
     const arbiterContext = {
       language,
@@ -1592,7 +1592,7 @@ class YouTubeAutomationAgent {
    * unsourced generation, but records why, because "the video ignored my guide"
    * is otherwise indistinguishable from "the guide could not be read".
    */
-  async ingestSourceDocument(sourceUrl, jobId) {
+  async ingestSourceDocument(sourceUrl, jobId, subjectOverride = null) {
     if (!sourceUrl) return null;
 
     if (!this.sourceIngestion) {
@@ -1601,7 +1601,36 @@ class YouTubeAutomationAgent {
 
     try {
       await this.updateJobStage(jobId, 'source_ingestion', 5, { sourceUrl });
-      const document = await this.sourceIngestion.ingest(sourceUrl);
+
+      // The guide supplies the words; it is not what the viewer must be shown.
+      // A how-to article about an insurer's customer area is not that customer
+      // area, and illustrating the video with the article pictures the wrong
+      // website. Content and visuals therefore come from two different pages.
+      const document = await this.sourceIngestion.ingest(sourceUrl, { screenshots: false });
+
+      const subjectUrl = subjectOverride || document.subjectUrl;
+      if (subjectUrl) {
+        try {
+          const subject = await this.sourceIngestion.ingest(subjectUrl);
+          document.subject = {
+            url: subject.url,
+            title: subject.title,
+            screenshots: subject.screenshots,
+          };
+          // Visual matching reads `screenshots` off the source document.
+          document.screenshots = subject.screenshots;
+          this.logger.info(
+            `Visuals captured from the subject site ${subjectUrl}: ${subject.screenshots.length} screenshot(s)`
+          );
+        } catch (subjectError) {
+          this.logger.warn(`Subject site ${subjectUrl} could not be captured: ${subjectError.message}`);
+          document.screenshots = [];
+        }
+      } else {
+        this.logger.warn('No subject site identified — visuals will be generated rather than captured');
+        document.screenshots = [];
+      }
+
       this.logger.info(
         `Source guide ingested: "${document.title}" (${document.outline.length} chapters, ${document.screenshots.length} screenshots)`
       );

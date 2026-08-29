@@ -7,6 +7,7 @@ const sharp = require('sharp');
 const { Logger } = require('./logger');
 const { runFFmpeg, checkFFmpeg, getMediaDuration, ffmpegInstallHint } = require('./ffmpeg');
 const { MediaGenerationService } = require('./media-generation-service');
+const { resolveLanguage } = require('./i18n');
 
 // Encoding settings for slideshow renders. The picture is static between
 // crossfades, so a fast preset costs nothing visually while cutting render time
@@ -1184,7 +1185,7 @@ class AIVideoGenerator {
         return await this.simulateThumbnailGeneration(script, style);
       }
 
-      const prompt = `YouTube thumbnail for "${script.title}", ${style} style, eye-catching, high contrast text, professional design, clickable, engaging`;
+      const prompt = this.buildThumbnailPrompt(script, style);
       const thumbnailPath = path.join(__dirname, '..', 'uploads', 'thumbnails', `thumbnail_${Date.now()}.png`);
 
       await this.generateImage(prompt, thumbnailPath);
@@ -1199,6 +1200,55 @@ class AIVideoGenerator {
       this.logger.error('Thumbnail generation failed:', error);
       return await this.simulateThumbnailGeneration(script, style);
     }
+  }
+
+  /**
+   * Compose a thumbnail brief in the high-CTR YouTube idiom: a real person
+   * reacting or pointing, a few very large words, and supporting iconography.
+   *
+   * The previous one-liner asked for an "ethereal" thumbnail and got abstract
+   * artwork nobody clicks. Two constraints matter beyond composition: any text
+   * rendered must be in the video's own language — an English overlay on a
+   * French video is the same defect this pipeline exists to remove — and it must
+   * be short, because image models mangle long strings.
+   */
+  buildThumbnailPrompt(script, style = 'youtube') {
+    const language = resolveLanguage(script.language || script.metadata?.strategy?.language);
+    const french = language === 'fr';
+    const headline = this.thumbnailHeadline(script.title);
+
+    if (style && style !== 'youtube' && style !== 'ethereal') {
+      return [
+        `YouTube thumbnail for "${script.title}"`,
+        `${style} style, eye-catching, high contrast, professional, clickable`,
+      ].join('. ');
+    }
+
+    return [
+      'Photorealistic YouTube thumbnail, 16:9, high click-through style.',
+      'Composition: a friendly professional person on the right side, waist-up, ' +
+        'business-casual, looking at the camera and pointing toward the left where the text sits.',
+      'Left two-thirds reserved for very large bold sans-serif text with a thick outline, high contrast on a darker background.',
+      `Headline text to render, exactly and only this: "${headline}".`,
+      french
+        ? 'All rendered text must be in French. Do not add any English words anywhere in the image.'
+        : 'All rendered text must be in English.',
+      'Supporting elements: subtle interface icons and a smartphone showing a login screen, deep blue and gold accents, soft glow.',
+      'No watermark, no logo of any real company, no paragraph of small text, no gibberish lettering.',
+    ].join(' ');
+  }
+
+  /**
+   * Image models render a handful of words reliably and longer strings as
+   * garbled shapes, so the headline is trimmed to its most meaningful part.
+   */
+  thumbnailHeadline(title) {
+    const clean = String(title || '').replace(/\s+/g, ' ').trim();
+    // Titles are usually "Subject : qualifier"; the qualifier is the hook.
+    const [subject, ...rest] = clean.split(/\s*[:\u2014\u2013-]\s*/);
+    const qualifier = rest.join(' ').trim();
+    const headline = qualifier && qualifier.length <= 34 ? `${subject} - ${qualifier}` : subject;
+    return headline.slice(0, 48).toUpperCase();
   }
 
   async getFileSize(filePath) {

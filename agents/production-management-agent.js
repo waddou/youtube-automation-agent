@@ -230,222 +230,81 @@ class ProductionManagementAgent {
     return lines.join('\n').replace(/\n{3,}/g, '\n\n').trim() + '\n';
   }
 
+  /**
+   * Settle on the best available thumbnail.
+   *
+   * `generateThumbnail` does not throw when no image provider is reachable — it
+   * returns a simulated `.info` stub. The old code treated any returned value as
+   * a success, so that stub overwrote the perfectly good PNG the thumbnail
+   * designer had already rendered, and the production ended up with no usable
+   * thumbnail at all. Never accept a downgrade: a placeholder loses to a real
+   * image every time.
+   */
   async processThumbnail(thumbnail, script) {
+    const designed = thumbnail?.path || null;
+    let aiThumbnail = null;
+
     try {
-      // Try to generate AI thumbnail first
       const thumbnailScript = thumbnail.script || script || { title: thumbnail.title || 'Untitled Video' };
-      const aiThumbnail = await this.aiVideoGenerator.generateThumbnail(thumbnailScript, 'ethereal');
-      
+      aiThumbnail = await this.aiVideoGenerator.generateThumbnail(thumbnailScript, 'youtube');
+    } catch (error) {
+      this.logger.warn(`AI thumbnail generation failed: ${error.message}`);
+    }
+
+    if (aiThumbnail?.path && await this.isRealImageFile(aiThumbnail.path)) {
       return {
         path: aiThumbnail.path,
-        originalPath: thumbnail.path,
+        originalPath: designed,
         dimensions: aiThumbnail.dimensions,
         fileSize: aiThumbnail.fileSize,
         generatedWith: 'AI'
       };
-    } catch (error) {
-      this.logger.error('AI thumbnail generation failed:', error);
-      
-      // Fallback to original processing
-      const productionThumbnailPath = path.join(
-        __dirname, '..', 'data', 'assets', 
-        `thumbnail_${Date.now()}.jpg`
-      );
-      
-      if (thumbnail.path && await fs.access(thumbnail.path).then(() => true).catch(() => false)) {
-        const originalBuffer = await fs.readFile(thumbnail.path);
-        await fs.writeFile(productionThumbnailPath, originalBuffer);
-      } else {
-        // Create placeholder
-        await fs.writeFile(productionThumbnailPath + '.placeholder', 'Thumbnail placeholder');
-      }
-      
+    }
+
+    if (designed && await this.isRealImageFile(designed)) {
+      this.logger.info('Keeping the designed thumbnail: no AI image provider produced a usable one');
+      let fileSize = null;
+      try {
+        fileSize = (await fs.stat(designed)).size;
+      } catch (_error) { /* size is informational only */ }
       return {
-        path: productionThumbnailPath,
-        originalPath: thumbnail.path,
-        dimensions: thumbnail.dimensions || { width: 1792, height: 1024 },
-        fileSize: thumbnail.fileSize || 0
+        path: designed,
+        originalPath: designed,
+        dimensions: thumbnail.dimensions || { width: 1280, height: 720 },
+        fileSize,
+        generatedWith: 'designer'
       };
     }
+
+    this.logger.warn('No usable thumbnail could be produced');
+    return {
+      path: aiThumbnail?.path || designed,
+      originalPath: designed,
+      dimensions: thumbnail.dimensions || null,
+      fileSize: null,
+      generatedWith: 'placeholder',
+      simulated: true
+    };
   }
 
-  calculatePublishTime(strategy) {
-    // Use strategy's recommended time or calculate optimal time
-    if (strategy.bestPublishTime) {
-      return strategy.bestPublishTime;
-    }
-    
-    // Default: next optimal publishing window
-    const now = new Date();
-    const tomorrow = new Date(now);
-    tomorrow.setDate(now.getDate() + 1);
-    tomorrow.setHours(14, 0, 0, 0); // 2 PM default
-    
-    return tomorrow.toISOString();
-  }
-
-  calculatePriority(strategy) {
-    let priority = 50; // Base priority
-    
-    // Adjust based on estimated views
-    if (strategy.estimatedViews > 100000) priority += 30;
-    else if (strategy.estimatedViews > 50000) priority += 20;
-    else if (strategy.estimatedViews > 10000) priority += 10;
-    
-    // Adjust based on trend score
-    if (strategy.competitorAnalysis && strategy.competitorAnalysis.length > 0) {
-      priority += 10;
-    }
-    
-    // Time sensitivity
-    const hoursUntilPublish = (new Date(strategy.bestPublishTime) - new Date()) / (1000 * 60 * 60);
-    if (hoursUntilPublish < 24) priority += 20;
-    else if (hoursUntilPublish < 48) priority += 10;
-    
-    return Math.min(100, priority);
-  }
-
-  async generateVideoContent(productionData) {
-    this.logger.info('Generating AI video content...');
-
+  /**
+   * A real raster image, checked by magic bytes rather than file extension —
+   * the pipeline has a history of writing JSON into files it calls assets.
+   */
+  async isRealImageFile(filePath) {
     try {
-      const { script } = productionData;
-      const sourceDocument = productionData.sourceDocument || script.metadata?.strategy?.sourceDocument || null;
-      const context = {
-        sourceDocument,
-        contentType: script.metadata?.strategy?.contentType || null,
-        language: script.language || script.metadata?.strategy?.language || null,
-      };
-
-      const briefs = this.createVisualPromptsFromScript(script, context);
-
-      // A screenshot of the page being explained beats any generated
-      // illustration of it, so real captures are matched to their section first
-      // and generation only fills the gaps.
-      const screenshots = this.matchScreenshotsToBriefs(briefs, sourceDocument);
-
-      const visualAssets = [];
-      for (const [index, brief] of briefs.entries()) {
-        const screenshot = screenshots.get(index);
-        if (screenshot) {
-          visualAssets.push(screenshot);
-          continue;
-        }
-        const assets = await this.aiVideoGenerator.generateVisualAssets(brief.prompt, brief.style, 1);
-        visualAssets.push(...assets);
-      }
-
-      productionData.assets.video = {
-        visualAssets: visualAssets,
-        visualBriefs: briefs.map((brief, index) => ({
-          label: brief.label,
-          style: brief.style,
-          sectionIndex: brief.sectionIndex,
-          source: screenshots.has(index) ? 'source_screenshot' : 'generated',
-        })),
-        duration: productionData.estimatedDuration,
-        format: 'mp4',
-        resolution: '1920x1080',
-        fps: 30,
-        generatedWith: 'AI'
-      };
-
-      productionData.timeline.videoGenerated = new Date().toISOString();
-
-      return visualAssets;
-    } catch (error) {
-      this.logger.error('AI video content generation failed:', error);
-      // Fallback to placeholder
-      return await this.createVideoElements(productionData);
+      const target = String(filePath);
+      if (target.endsWith('.info') || /placeholder|_sim_/.test(target)) return false;
+      const buffer = await fs.readFile(target);
+      if (buffer.length < 2048) return false;
+      const isPng = buffer.subarray(0, 8).equals(Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]));
+      const isJpeg = buffer[0] === 0xff && buffer[1] === 0xd8 && buffer[2] === 0xff;
+      const isWebp = buffer.subarray(0, 4).toString('ascii') === 'RIFF' &&
+        buffer.subarray(8, 12).toString('ascii') === 'WEBP';
+      return isPng || isJpeg || isWebp;
+    } catch (_error) {
+      return false;
     }
-  }
-
-  async createVideoElements(productionData) {
-    const { script } = productionData;
-    const elements = [];
-    
-    // Title slide
-    elements.push({
-      type: 'title_slide',
-      content: script.title,
-      duration: 3,
-      style: 'modern',
-      animation: 'fade_in'
-    });
-    
-    // Content sections
-    if (script.mainContent && script.mainContent.sections) {
-      script.mainContent.sections.forEach((section) => {
-        // Section title
-        elements.push({
-          type: 'section_title',
-          content: section.title,
-          duration: 2,
-          style: 'minimal',
-          animation: 'slide_in'
-        });
-        
-        // Content visuals
-        if (section.type === 'list_items' && section.items) {
-          section.items.forEach(item => {
-            elements.push({
-              type: 'list_item',
-              content: {
-                number: item.number,
-                title: item.title,
-                description: item.description
-              },
-              duration: 15,
-              style: 'countdown',
-              animation: 'zoom_in'
-            });
-          });
-        } else if (section.type === 'solution_steps' && section.steps) {
-          section.steps.forEach(step => {
-            elements.push({
-              type: 'step',
-              content: {
-                number: step.number,
-                title: step.title,
-                description: step.description
-              },
-              duration: 20,
-              style: 'tutorial',
-              animation: 'step_by_step'
-            });
-          });
-        } else {
-          // Generic content slide
-          elements.push({
-            type: 'content_slide',
-            content: section.title,
-            duration: section.duration || 30,
-            style: 'informative',
-            animation: 'fade_transition'
-          });
-        }
-      });
-    }
-    
-    // Conclusion slide
-    elements.push({
-      type: 'conclusion',
-      content: 'Key Takeaways',
-      duration: 5,
-      style: 'summary',
-      animation: 'reveal'
-    });
-    
-    // Subscribe reminder
-    elements.push({
-      type: 'subscribe_reminder',
-      content: 'Subscribe for More!',
-      duration: 3,
-      style: 'call_to_action',
-      animation: 'bounce'
-    });
-    
-    return elements;
   }
 
   async generateAudioNarration(productionData) {

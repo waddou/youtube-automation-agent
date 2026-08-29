@@ -74,7 +74,9 @@ class SystemTest {
       { name: 'Localized YouTube Description', test: () => this.testLocalizedDescription() },
       { name: 'Narration Chunking For TTS', test: () => this.testNarrationChunking() },
       { name: 'No Fabricated Credibility Claims', test: () => this.testNoFabricatedCredibility() },
-      { name: 'Video Duration Matches Narration', test: () => this.testVideoDurationMatchesNarration() }
+      { name: 'Video Duration Matches Narration', test: () => this.testVideoDurationMatchesNarration() },
+      { name: 'Guide And Subject Site Are Distinct', test: () => this.testSubjectSiteDetection() },
+      { name: 'Thumbnail Never Downgrades', test: () => this.testThumbnailNeverDowngrades() }
     ];
 
     let passed = 0;
@@ -3853,6 +3855,103 @@ class SystemTest {
     if (escaped.includes('<script>')) {
       throw new Error('Slide content is not HTML-escaped');
     }
+  }
+
+  /**
+   * A how-to guide and the site it describes are two different things.
+   *
+   * Illustrating a video with screenshots of the guide shows the viewer the
+   * instructions instead of the interface they must actually operate — the
+   * visuals picture the wrong website entirely.
+   */
+  async testSubjectSiteDetection() {
+    const { SourceIngestionService } = require('./utils/source-ingestion-service');
+    const service = new SourceIngestionService({ captureScreenshots: false });
+
+    // Security-conscious guides mention the official address as plain text
+    // rather than linking it, so readers type it themselves.
+    const html = `<!doctype html><html lang="fr"><body>
+      <h1>Mon espace assurance</h1>
+      <p>Le portail officiel est monassureur-exemple.fr et reste la référence pour vos démarches en ligne.</p>
+      <h2>Se connecter</h2>
+      <p>Rendez-vous sur monassureur-exemple.fr puis saisissez vos identifiants habituels pour accéder au service.</p>
+      <a href="https://www.linkedin.com/share">Partager</a>
+      <a href="https://leguide-exemple.com/autre">Autre article du guide</a>
+      </body></html>`;
+
+    const detected = service.detectSubjectUrl(html, 'https://leguide-exemple.com/mon-espace');
+    if (!detected || !detected.includes('monassureur-exemple.fr')) {
+      throw new Error(`Subject site not detected from plain-text mentions: ${detected}`);
+    }
+    if (detected.includes('leguide-exemple.com')) {
+      throw new Error('The guide itself was mistaken for its subject');
+    }
+    if (detected.includes('linkedin')) {
+      throw new Error('A social link was mistaken for the subject site');
+    }
+
+    // A single passing mention is not evidence.
+    const weak = service.detectSubjectUrl(
+      '<html><body><p>Voir aussi autresite-exemple.fr pour information.</p></body></html>',
+      'https://leguide-exemple.com/page'
+    );
+    if (weak !== null) throw new Error(`A single mention was treated as the subject: ${weak}`);
+
+    // Hosts are normalised without "www.", but many sites only answer there.
+    if (service.toggleWww('https://exemple.fr/') !== 'https://www.exemple.fr/') {
+      throw new Error('www fallback does not add the subdomain');
+    }
+    if (service.toggleWww('https://www.exemple.fr/') !== 'https://exemple.fr/') {
+      throw new Error('www fallback does not strip the subdomain');
+    }
+  }
+
+  /**
+   * When no image provider is reachable, `generateThumbnail` returns a simulated
+   * stub instead of throwing. Treating that as success overwrote the perfectly
+   * good PNG the designer had already rendered.
+   */
+  async testThumbnailNeverDowngrades() {
+    const { ProductionManagementAgent } = require('./agents/production-management-agent');
+    const agent = Object.create(ProductionManagementAgent.prototype);
+    agent.logger = { info: () => {}, warn: () => {}, error: () => {} };
+
+    const fsPromises = require('fs').promises;
+    const designedPath = path.join(__dirname, 'temp', 'test-designed-thumb.png');
+    await fsPromises.mkdir(path.dirname(designedPath), { recursive: true });
+    // A minimal but valid PNG larger than the 2 KB sanity floor.
+    const png = Buffer.concat([
+      Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]),
+      Buffer.alloc(4096, 1),
+    ]);
+    await fsPromises.writeFile(designedPath, png);
+
+    // The AI path returns a placeholder stub rather than throwing.
+    agent.aiVideoGenerator = {
+      generateThumbnail: async () => ({ path: '/tmp/thumbnail_sim_123.info' }),
+    };
+
+    const result = await agent.processThumbnail({ path: designedPath }, { title: 'Titre' });
+    if (result.path !== designedPath) {
+      throw new Error(`A placeholder replaced the designed thumbnail: ${result.path}`);
+    }
+    if (result.generatedWith !== 'designer') {
+      throw new Error(`Expected the designed thumbnail to be kept, got "${result.generatedWith}"`);
+    }
+
+    // A genuine AI image must still win.
+    const aiPath = path.join(__dirname, 'temp', 'test-ai-thumb.png');
+    await fsPromises.writeFile(aiPath, png);
+    agent.aiVideoGenerator = {
+      generateThumbnail: async () => ({ path: aiPath, dimensions: { width: 1280, height: 720 }, fileSize: png.length }),
+    };
+    const better = await agent.processThumbnail({ path: designedPath }, { title: 'Titre' });
+    if (better.path !== aiPath || better.generatedWith !== 'AI') {
+      throw new Error('A usable AI thumbnail was not preferred');
+    }
+
+    await fsPromises.unlink(designedPath).catch(() => {});
+    await fsPromises.unlink(aiPath).catch(() => {});
   }
 }
 
