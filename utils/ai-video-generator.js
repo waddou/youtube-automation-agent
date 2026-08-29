@@ -52,6 +52,16 @@ class AIVideoGenerator {
       }
     }
     
+    // OpenRouter exposes several image models behind one key. It matters as a
+    // fallback because a Gemini key that has run out of credits fails every
+    // image request, and the pipeline then has no imagery at all.
+    const openRouterKey = resolvedCredentials.openRouter?.apiKey || process.env.OPENROUTER_API_KEY;
+    if (openRouterKey) {
+      this.openRouter = new OpenAI({ baseURL: 'https://openrouter.ai/api/v1', apiKey: openRouterKey });
+      this.openRouterImageModel = process.env.OPENROUTER_IMAGE_MODEL || 'google/gemini-2.5-flash-image';
+      this.logger.info(`OpenRouter image service initialized (model: ${this.openRouterImageModel})`);
+    }
+
     // ElevenLabs configuration
     this.elevenLabsApiKey = resolvedCredentials.elevenLabs?.apiKey || process.env.ELEVENLABS_API_KEY;
     this.elevenLabsVoiceId = resolvedCredentials.elevenLabs?.voiceId || process.env.ELEVENLABS_VOICE_ID;
@@ -401,7 +411,7 @@ class AIVideoGenerator {
     this.logger.info(`Generating ${count} visual assets with style: ${resolvedStyle}`);
 
     try {
-      if (!this.openai && !this.gemini) {
+      if (!this.openai && !this.gemini && !this.openRouter) {
         return await this.simulateVisualAssets(subject, resolvedStyle, count);
       }
 
@@ -422,18 +432,64 @@ class AIVideoGenerator {
     }
   }
 
+  /**
+   * Generate one image, trying each configured provider in turn.
+   *
+   * Providers fail for reasons that are specific to an account rather than to
+   * the request — an exhausted quota, a model the plan cannot call. Stopping at
+   * the first error left videos with no imagery even when another usable
+   * provider was configured, so every provider gets a turn before giving up.
+   */
   async generateImage(prompt, imagePath) {
     await fs.mkdir(path.dirname(imagePath), { recursive: true });
 
-    if (this.openai) {
-      return await this.generateOpenAIImage(prompt, imagePath);
-    }
+    const providers = [
+      this.openai && { name: 'OpenAI', run: () => this.generateOpenAIImage(prompt, imagePath) },
+      this.gemini && { name: 'Gemini', run: () => this.generateGeminiImage(prompt, imagePath) },
+      this.openRouter && { name: 'OpenRouter', run: () => this.generateOpenRouterImage(prompt, imagePath) },
+    ].filter(Boolean);
 
-    if (this.gemini) {
-      return await this.generateGeminiImage(prompt, imagePath);
-    }
+    if (!providers.length) throw new Error('No image generation provider configured');
 
-    throw new Error('No image generation provider configured');
+    let lastError = null;
+    for (const provider of providers) {
+      try {
+        return await provider.run();
+      } catch (error) {
+        lastError = error;
+        this.logger.warn(`${provider.name} image generation failed: ${String(error.message).slice(0, 200)}`);
+      }
+    }
+    throw lastError;
+  }
+
+  async generateOpenRouterImage(prompt, imagePath) {
+    const response = await this.openRouter.chat.completions.create({
+      model: this.openRouterImageModel,
+      messages: [{ role: 'user', content: prompt }],
+      // OpenRouter returns images on the chat endpoint when this is requested.
+      modalities: ['image', 'text'],
+    });
+
+    const image = response.choices?.[0]?.message?.images?.[0];
+    const dataUrl = image?.image_url?.url;
+    if (!dataUrl) throw new Error('OpenRouter returned no image data');
+
+    const base64 = dataUrl.includes(',') ? dataUrl.split(',')[1] : dataUrl;
+    const buffer = Buffer.from(base64, 'base64');
+    const metadata = await sharp(buffer, { failOn: 'error' }).metadata();
+    if (!metadata.width || !metadata.height) throw new Error('OpenRouter returned an invalid image');
+
+    const extension = path.extname(imagePath).toLowerCase();
+    // These models return a square regardless of what the prompt asks for, and
+    // a square dropped into a 16:9 timeline is cropped on the sides — often
+    // straight through the subject. Fit it to the frame here instead.
+    const output = sharp(buffer, { failOn: 'error' })
+      .resize(1920, 1080, { fit: 'cover', position: 'attention' });
+    if (extension === '.jpg' || extension === '.jpeg') await output.jpeg({ quality: 92 }).toFile(imagePath);
+    else if (extension === '.webp') await output.webp({ quality: 92 }).toFile(imagePath);
+    else await output.png().toFile(imagePath);
+    return imagePath;
   }
 
   async generateOpenAIImage(prompt, imagePath) {
@@ -1187,7 +1243,7 @@ class AIVideoGenerator {
     this.logger.info('Generating custom thumbnail...');
 
     try {
-      if (!this.openai && !this.gemini) {
+      if (!this.openai && !this.gemini && !this.openRouter) {
         return await this.simulateThumbnailGeneration(script, style);
       }
 
@@ -1290,7 +1346,7 @@ class AIVideoGenerator {
     this.logger.warn(`No image provider available — writing ${count} placeholder visual(s)`);
 
     const { createCanvas } = require('canvas');
-    const subject = String(prompt || '').replace(/\s+/g, ' ').trim();
+    const _subject = String(prompt || "").replace(/\s+/g, " ").trim();
 
     const palettes = {
       interface: ['#0f172a', '#1e293b'],
@@ -1317,10 +1373,17 @@ class AIVideoGenerator {
       ctx.fillStyle = gradient;
       ctx.fillRect(0, 0, 1920, 1080);
 
-      ctx.fillStyle = onLight ? 'rgba(15,23,42,0.92)' : 'rgba(255,255,255,0.92)';
-      ctx.textAlign = 'center';
-      ctx.font = 'bold 58px Arial';
-      this.wrapCanvasText(ctx, subject, 960, 470, 1560, 74, 4);
+      // Deliberately no text. The slideshow renders the section title and its
+      // wording as an HTML overlay on top of this image; drawing the same words
+      // into the background made every caption appear twice, on two layers.
+      ctx.strokeStyle = onLight ? 'rgba(15,23,42,0.10)' : 'rgba(255,255,255,0.10)';
+      ctx.lineWidth = 2;
+      for (let x = -1080; x < 1920; x += 120) {
+        ctx.beginPath();
+        ctx.moveTo(x, 0);
+        ctx.lineTo(x + 1080, 1080);
+        ctx.stroke();
+      }
 
       paths.push(assetPath);
       const buffer = canvas.toBuffer('image/png');

@@ -433,8 +433,10 @@ class YouTubeAutomationAgent {
           return res.status(validation.status).json({ success: false, error: validation.error });
         }
 
-        const { topic, style, length } = validation.value;
-        const result = await this.startGenerationJob({ topic, style, length, source: 'manual' });
+        // Forward every validated field. Cherry-picking three of them silently
+        // dropped the source guide URL and the strategy context, so a request
+        // that supplied them behaved exactly like one that did not.
+        const result = await this.startGenerationJob({ ...validation.value, source: 'manual' });
         res.status(202).json({ success: true, result });
       } catch (error) {
         res.status(error.status || 500).json({ success: false, error: error.message });

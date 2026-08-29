@@ -547,6 +547,186 @@ class ProductionManagementAgent {
   }
 
   // Helper method to create visual prompts from script content
+  calculatePriority(strategy) {
+    let priority = 50; // Base priority
+    
+    // Adjust based on estimated views
+    if (strategy.estimatedViews > 100000) priority += 30;
+    else if (strategy.estimatedViews > 50000) priority += 20;
+    else if (strategy.estimatedViews > 10000) priority += 10;
+    
+    // Adjust based on trend score
+    if (strategy.competitorAnalysis && strategy.competitorAnalysis.length > 0) {
+      priority += 10;
+    }
+    
+    // Time sensitivity
+    const hoursUntilPublish = (new Date(strategy.bestPublishTime) - new Date()) / (1000 * 60 * 60);
+    if (hoursUntilPublish < 24) priority += 20;
+    else if (hoursUntilPublish < 48) priority += 10;
+    
+    return Math.min(100, priority);
+  }
+
+  calculatePublishTime(strategy) {
+    // Use strategy's recommended time or calculate optimal time
+    if (strategy.bestPublishTime) {
+      return strategy.bestPublishTime;
+    }
+    
+    // Default: next optimal publishing window
+    const now = new Date();
+    const tomorrow = new Date(now);
+    tomorrow.setDate(now.getDate() + 1);
+    tomorrow.setHours(14, 0, 0, 0); // 2 PM default
+    
+    return tomorrow.toISOString();
+  }
+
+  /**
+   * Produce one visual per script section.
+   *
+   * Real screenshots of the subject site are matched to the sections they
+   * illustrate first, and generation only fills the gaps — a capture of the
+   * actual interface beats any drawing of it.
+   */
+  async generateVideoContent(productionData) {
+    this.logger.info('Generating AI video content...');
+
+    try {
+      const { script } = productionData;
+      const sourceDocument = productionData.sourceDocument || script.metadata?.strategy?.sourceDocument || null;
+      const context = {
+        sourceDocument,
+        contentType: script.metadata?.strategy?.contentType || null,
+        language: script.language || script.metadata?.strategy?.language || null,
+      };
+
+      const briefs = this.createVisualPromptsFromScript(script, context);
+      const screenshots = this.matchScreenshotsToBriefs(briefs, sourceDocument);
+
+      const visualAssets = [];
+      for (const [index, brief] of briefs.entries()) {
+        const screenshot = screenshots.get(index);
+        if (screenshot) {
+          visualAssets.push(screenshot);
+          continue;
+        }
+        const assets = await this.aiVideoGenerator.generateVisualAssets(brief.prompt, brief.style, 1);
+        visualAssets.push(...assets);
+      }
+
+      productionData.assets.video = {
+        visualAssets,
+        visualBriefs: briefs.map((brief, index) => ({
+          label: brief.label,
+          style: brief.style,
+          sectionIndex: brief.sectionIndex,
+          source: screenshots.has(index) ? 'source_screenshot' : 'generated',
+        })),
+        duration: productionData.estimatedDuration,
+        format: 'mp4',
+        resolution: '1920x1080',
+        fps: 30,
+        generatedWith: 'AI'
+      };
+
+      productionData.timeline.videoGenerated = new Date().toISOString();
+      return visualAssets;
+    } catch (error) {
+      this.logger.error('AI video content generation failed:', error);
+      return await this.createVideoElements(productionData);
+    }
+  }
+
+  async createVideoElements(productionData) {
+    const { script } = productionData;
+    const elements = [];
+    
+    // Title slide
+    elements.push({
+      type: 'title_slide',
+      content: script.title,
+      duration: 3,
+      style: 'modern',
+      animation: 'fade_in'
+    });
+    
+    // Content sections
+    if (script.mainContent && script.mainContent.sections) {
+      script.mainContent.sections.forEach((section) => {
+        // Section title
+        elements.push({
+          type: 'section_title',
+          content: section.title,
+          duration: 2,
+          style: 'minimal',
+          animation: 'slide_in'
+        });
+        
+        // Content visuals
+        if (section.type === 'list_items' && section.items) {
+          section.items.forEach(item => {
+            elements.push({
+              type: 'list_item',
+              content: {
+                number: item.number,
+                title: item.title,
+                description: item.description
+              },
+              duration: 15,
+              style: 'countdown',
+              animation: 'zoom_in'
+            });
+          });
+        } else if (section.type === 'solution_steps' && section.steps) {
+          section.steps.forEach(step => {
+            elements.push({
+              type: 'step',
+              content: {
+                number: step.number,
+                title: step.title,
+                description: step.description
+              },
+              duration: 20,
+              style: 'tutorial',
+              animation: 'step_by_step'
+            });
+          });
+        } else {
+          // Generic content slide
+          elements.push({
+            type: 'content_slide',
+            content: section.title,
+            duration: section.duration || 30,
+            style: 'informative',
+            animation: 'fade_transition'
+          });
+        }
+      });
+    }
+    
+    // Conclusion slide
+    elements.push({
+      type: 'conclusion',
+      content: 'Key Takeaways',
+      duration: 5,
+      style: 'summary',
+      animation: 'reveal'
+    });
+    
+    // Subscribe reminder
+    elements.push({
+      type: 'subscribe_reminder',
+      content: 'Subscribe for More!',
+      duration: 3,
+      style: 'call_to_action',
+      animation: 'bounce'
+    });
+    
+    return elements;
+  }
+
   /**
    * Derive one visual brief per script section, from the words that section
    * actually narrates.

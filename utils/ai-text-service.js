@@ -15,6 +15,7 @@ const PROVIDERS = {
     defaultModel: 'gpt-5.6',
     models: ['gpt-5.6', 'gpt-5.6-terra', 'gpt-5.6-luna'],
     envKey: 'OPENAI_API_KEY',
+    modelEnvKey: 'OPENAI_MODEL',
   },
   openrouter: {
     name: 'OpenRouter',
@@ -22,6 +23,7 @@ const PROVIDERS = {
     defaultModel: 'openai/gpt-5.6-sol',
     models: ['openai/gpt-5.6-sol', 'anthropic/claude-fable-5', 'google/gemini-3.7-flash', 'moonshotai/kimi-k3', 'z-ai/glm-5.3'],
     envKey: 'OPENROUTER_API_KEY',
+    modelEnvKey: 'OPENROUTER_MODEL',
   },
   kimi: {
     name: 'Kimi (Moonshot AI)',
@@ -29,6 +31,7 @@ const PROVIDERS = {
     defaultModel: 'kimi-k3',
     models: ['kimi-k3', 'kimi-k2.7-code', 'kimi-k2.6'],
     envKey: 'MOONSHOT_API_KEY',
+    modelEnvKey: 'MOONSHOT_MODEL',
   },
   mimo: {
     name: 'MiMo (Xiaomi)',
@@ -36,6 +39,7 @@ const PROVIDERS = {
     defaultModel: 'mimo-v2.5-pro',
     models: ['mimo-v2.5-pro', 'mimo-v2.5'],
     envKey: 'MIMO_API_KEY',
+    modelEnvKey: 'MIMO_MODEL',
   },
   glm: {
     name: 'GLM (Zhipu AI)',
@@ -43,6 +47,7 @@ const PROVIDERS = {
     defaultModel: 'glm-5.3',
     models: ['glm-5.3', 'glm-5.2', 'glm-5.1'],
     envKey: 'GLM_API_KEY',
+    modelEnvKey: 'GLM_MODEL',
   },
 };
 
@@ -83,7 +88,11 @@ class AITextService {
 
   _initOpenAICompatible(preset, apiKey, model) {
     this.client = new OpenAI({ apiKey, baseURL: preset.baseURL });
-    this.model = model || preset.defaultModel;
+    // An explicit choice wins, then the environment, then the preset default.
+    // The defaults name premium tiers that a free account cannot call at all,
+    // so without this an otherwise valid key fails on every request.
+    const fromEnv = preset.modelEnvKey ? process.env[preset.modelEnvKey] : null;
+    this.model = model || fromEnv || preset.defaultModel;
     this.providerName = preset.name;
     this.logger.info(`${preset.name} initialized (model: ${this.model})`);
   }

@@ -96,9 +96,58 @@ class SourceIngestionService {
       const alternate = this.toggleWww(url);
       if (alternate && /ENOTFOUND|EAI_AGAIN|ECONNREFUSED/.test(error.code || error.message || '')) {
         this.logger.info(`${url} did not resolve; retrying as ${alternate}`);
-        return { html: await this.requestHtml(alternate), url: alternate };
+        try {
+          return { html: await this.requestHtml(alternate), url: alternate };
+        } catch (alternateError) {
+          return this.fetchHtmlViaBrowser(alternate, alternateError);
+        }
       }
-      throw error;
+      return this.fetchHtmlViaBrowser(url, error);
+    }
+  }
+
+  /**
+   * Fall back to a real browser when a plain HTTP request is refused.
+   *
+   * Banking and insurance sites — exactly the subjects these guides describe —
+   * routinely answer 403 to anything that does not look like a browser, and some
+   * only render their content through JavaScript. Since a browser is already a
+   * dependency for screenshots, use it rather than abandoning the page.
+   */
+  async fetchHtmlViaBrowser(url, originalError) {
+    const status = originalError?.response?.status;
+    const worthRetrying = !status || [401, 403, 406, 429, 500, 503].includes(status);
+    if (!worthRetrying) throw originalError;
+
+    let chromium;
+    try {
+      ({ chromium } = require('playwright'));
+    } catch (_error) {
+      throw originalError;
+    }
+
+    this.logger.info(`${url} refused a direct request (${status || 'network'}); retrying through a browser`);
+
+    let browser;
+    try {
+      browser = await chromium.launch({ args: ['--no-sandbox', '--disable-dev-shm-usage'] });
+      const context = await browser.newContext({
+        viewport: { width: 1920, height: 1080 },
+        locale: 'fr-FR',
+      });
+      const page = await context.newPage();
+      const response = await page.goto(url, { waitUntil: 'domcontentloaded', timeout: this.timeout });
+      if (response && response.status() >= 400) {
+        throw new Error(`Browser fetch returned HTTP ${response.status()}`);
+      }
+      await this.dismissConsentBanners(page);
+      const html = await page.content();
+      return { html, url: page.url() };
+    } catch (browserError) {
+      // Report the original refusal: it explains why the browser was needed.
+      throw new Error(`${originalError.message} (browser fallback also failed: ${browserError.message})`);
+    } finally {
+      await browser?.close().catch(() => {});
     }
   }
 
