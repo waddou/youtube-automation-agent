@@ -995,7 +995,13 @@ class AIVideoGenerator {
     
     if (script.mainContent && script.mainContent.sections) {
       script.mainContent.sections.forEach((section, index) => {
-        const assetIndex = Math.min(index + 1, visualAssets.length - 1);
+        // Cycle through the available visuals rather than clamping to the last
+        // one: clamping left every section past the final asset sharing the same
+        // frame, so a video with more sections than screenshots froze on one
+        // image for its entire second half.
+        const assetIndex = visualAssets.length
+          ? (index + 1) % visualAssets.length
+          : 0;
         
         slides.push(`
         <div class="slide">
