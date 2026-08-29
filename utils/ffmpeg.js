@@ -44,6 +44,28 @@ async function runFFmpeg(args) {
   return execFileAsync(getFFmpegPath(), args, { maxBuffer: 32 * 1024 * 1024 });
 }
 
+/**
+ * Duration of a media file in seconds, or null if it cannot be determined.
+ *
+ * Uses ffmpeg itself rather than ffprobe, which is not a project dependency.
+ * `ffmpeg -i <file>` with no output exits non-zero by design, so the duration
+ * is read from stderr in both the success and failure branches.
+ */
+async function getMediaDuration(filePath) {
+  const parse = text => {
+    const match = /Duration:\s*(\d+):(\d{2}):(\d{2}(?:\.\d+)?)/.exec(String(text || ''));
+    if (!match) return null;
+    return Number(match[1]) * 3600 + Number(match[2]) * 60 + Number(match[3]);
+  };
+
+  try {
+    const { stderr } = await execFileAsync(getFFmpegPath(), ['-i', filePath], { maxBuffer: 8 * 1024 * 1024 });
+    return parse(stderr);
+  } catch (error) {
+    return parse(error.stderr);
+  }
+}
+
 function ffmpegInstallHint() {
   const hints = {
     win32: 'winget install Gyan.FFmpeg (then restart your terminal)',
@@ -55,4 +77,4 @@ function ffmpegInstallHint() {
   return `FFmpeg not found. Install it with: ${platformHint} — or run "npm install" again to fetch the bundled ffmpeg-static binary, or set FFMPEG_PATH to your ffmpeg executable.`;
 }
 
-module.exports = { getFFmpegPath, checkFFmpeg, runFFmpeg, ffmpegInstallHint };
+module.exports = { getFFmpegPath, checkFFmpeg, runFFmpeg, getMediaDuration, ffmpegInstallHint };

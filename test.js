@@ -73,7 +73,8 @@ class SystemTest {
       { name: 'Null Strategy Context Handling', test: () => this.testNullStrategyContextHandling() },
       { name: 'Localized YouTube Description', test: () => this.testLocalizedDescription() },
       { name: 'Narration Chunking For TTS', test: () => this.testNarrationChunking() },
-      { name: 'No Fabricated Credibility Claims', test: () => this.testNoFabricatedCredibility() }
+      { name: 'No Fabricated Credibility Claims', test: () => this.testNoFabricatedCredibility() },
+      { name: 'Video Duration Matches Narration', test: () => this.testVideoDurationMatchesNarration() }
     ];
 
     let passed = 0;
@@ -3780,6 +3781,52 @@ class SystemTest {
       const cleaned = writer.cleanSectionTitle(raw);
       if (cleaned !== expected) {
         throw new Error(`cleanSectionTitle("${raw}") returned "${cleaned}", expected "${expected}"`);
+      }
+    }
+  }
+
+  /**
+   * The rendered video must be at least as long as the narration.
+   *
+   * Two independent defects made a 9-minute voice track come out as a 25-second
+   * video, then as a video 4 seconds short: the script-length estimate ignored
+   * array-shaped section content, and the slide timing ignored the overlap
+   * introduced by each crossfade. Both truncated the narration at the mux.
+   */
+  async testVideoDurationMatchesNarration() {
+    const { AIVideoGenerator } = require('./utils/ai-video-generator');
+    const generator = Object.create(AIVideoGenerator.prototype);
+
+    // 1. Array-shaped content (what the AI path returns) must be counted.
+    const sentence = 'Voici une phrase de narration qui compte exactement douze mots pour ce calcul.';
+    const script = {
+      hook: { text: sentence },
+      introduction: { greeting: 'Bonjour.', topicIntro: sentence, valueProposition: sentence, credibility: '' },
+      mainContent: {
+        sections: Array.from({ length: 8 }, (_unused, index) => ({
+          title: `Section ${index + 1}`,
+          content: Array.from({ length: 12 }, () => sentence),
+        })),
+      },
+      conclusion: { recap: [sentence], finalThought: sentence },
+      callToAction: { subscribe: sentence, like: sentence, comment: sentence },
+    };
+
+    const estimated = generator.calculateScriptDuration(script);
+    // ~1200 words at 150 wpm is roughly eight minutes; the old code returned its
+    // 30-second floor because `content` was an array.
+    if (estimated < 300) {
+      throw new Error(`Array-shaped script content is still uncounted: estimated ${estimated}s`);
+    }
+
+    // 2. Slide timing must absorb the crossfade overlaps.
+    const fade = 0.5;
+    for (const [slides, target] of [[8, 569], [3, 120], [12, 900]]) {
+      const transitions = slides - 1;
+      const perSlide = Math.max(2, (target + fade * transitions) / slides);
+      const rendered = perSlide * slides - fade * transitions;
+      if (Math.abs(rendered - target) > 0.01) {
+        throw new Error(`${slides} slides render ${rendered.toFixed(2)}s for a ${target}s target`);
       }
     }
   }

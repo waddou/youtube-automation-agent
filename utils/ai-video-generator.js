@@ -5,8 +5,13 @@ const path = require('path');
 const axios = require('axios');
 const sharp = require('sharp');
 const { Logger } = require('./logger');
-const { runFFmpeg, checkFFmpeg, ffmpegInstallHint } = require('./ffmpeg');
+const { runFFmpeg, checkFFmpeg, getMediaDuration, ffmpegInstallHint } = require('./ffmpeg');
 const { MediaGenerationService } = require('./media-generation-service');
+
+// Encoding settings for slideshow renders. The picture is static between
+// crossfades, so a fast preset costs nothing visually while cutting render time
+// of a 9-minute 1080p slideshow from tens of minutes to a couple.
+const SLIDESHOW_ENCODE = ['-preset', 'veryfast', '-crf', '24', '-tune', 'stillimage'];
 
 class AIVideoGenerator {
   constructor(credentials, options = {}) {
@@ -106,42 +111,123 @@ class AIVideoGenerator {
     }
   }
 
+  /**
+   * Narrate with ElevenLabs, segment by segment.
+   *
+   * Same rationale as the Gemini path: one request for a whole 8-12 minute
+   * script is slow, hits per-request character limits, and loses everything
+   * already synthesised when it fails. Segments are cached on disk so a retry
+   * only pays for what is missing.
+   */
   async generateElevenLabsTTS(text, outputPath) {
-    const url = `https://api.elevenlabs.io/v1/text-to-speech/${this.elevenLabsVoiceId}`;
-    
-    const data = {
-      text: text,
-      model_id: this.elevenLabsModel,
-      voice_settings: {
-        stability: 0.5,
-        similarity_boost: 0.8,
-        style: 0.0,
-        use_speaker_boost: true
+    const chunks = this.splitNarrationForTTS(text);
+
+    if (chunks.length === 1) {
+      await this.synthesizeElevenLabsChunk(chunks[0], outputPath);
+      this.logger.info('ElevenLabs TTS generation complete');
+      return outputPath;
+    }
+
+    this.logger.info(`Narrating ${chunks.length} segments with ElevenLabs...`);
+    const parts = [];
+    for (const [index, chunk] of chunks.entries()) {
+      const partPath = `${outputPath}.part${String(index).padStart(2, '0')}.mp3`;
+      if (await this.isUsableAudioFile(partPath)) {
+        this.logger.info(`  segment ${index + 1}/${chunks.length} reused from cache`);
+        parts.push(partPath);
+        continue;
       }
-    };
+      try {
+        await this.synthesizeElevenLabsChunk(chunk, partPath);
+      } catch (error) {
+        this.logger.warn(
+          `Narration stopped at segment ${index + 1}/${chunks.length}; ` +
+          `${parts.length} completed segment(s) kept for the next attempt`
+        );
+        throw error;
+      }
+      parts.push(partPath);
+      this.logger.info(`  segment ${index + 1}/${chunks.length} done`);
+    }
 
-    const response = await axios({
-      method: 'POST',
-      url: url,
-      data: data,
-      headers: {
-        'Accept': 'audio/mpeg',
-        'Content-Type': 'application/json',
-        'xi-api-key': this.elevenLabsApiKey
-      },
-      responseType: 'stream'
-    });
+    await this.concatAudioFiles(parts, outputPath);
+    // Only drop the cache once the finished file exists.
+    await Promise.all(parts.map(part => fs.unlink(part).catch(() => {})));
 
-    const writer = require('fs').createWriteStream(outputPath);
-    response.data.pipe(writer);
+    this.logger.info('ElevenLabs TTS generation complete');
+    return outputPath;
+  }
 
-    return new Promise((resolve, reject) => {
-      writer.on('finish', () => {
-        this.logger.info('ElevenLabs TTS generation complete');
-        resolve(outputPath);
-      });
-      writer.on('error', reject);
-    });
+  async synthesizeElevenLabsChunk(text, outputPath) {
+    const url = `https://api.elevenlabs.io/v1/text-to-speech/${this.elevenLabsVoiceId}`;
+    const attempts = Math.max(1, Number(process.env.ELEVENLABS_TTS_RETRIES || 3));
+
+    let lastError = null;
+    for (let attempt = 1; attempt <= attempts; attempt += 1) {
+      try {
+        const response = await axios({
+          method: 'POST',
+          url,
+          data: {
+            text,
+            model_id: this.elevenLabsModel,
+            voice_settings: {
+              stability: 0.5,
+              similarity_boost: 0.8,
+              style: 0.0,
+              use_speaker_boost: true
+            }
+          },
+          headers: {
+            Accept: 'audio/mpeg',
+            'Content-Type': 'application/json',
+            'xi-api-key': this.elevenLabsApiKey
+          },
+          // Buffer rather than stream: a streamed error response would otherwise
+          // be written into the .mp3 as if it were audio.
+          responseType: 'arraybuffer',
+          timeout: Number(process.env.ELEVENLABS_TIMEOUT_MS || 180000)
+        });
+
+        const audio = Buffer.from(response.data);
+        if (audio.length < 1000) throw new Error('ElevenLabs returned an empty audio payload');
+        await fs.mkdir(path.dirname(outputPath), { recursive: true });
+        await fs.writeFile(outputPath, audio);
+        return outputPath;
+      } catch (error) {
+        // Surface the API's own explanation; an arraybuffer error body is a
+        // Buffer and would otherwise print as unreadable bytes.
+        let detail = error.message;
+        if (error.response?.data) {
+          try {
+            detail = Buffer.isBuffer(error.response.data)
+              ? Buffer.from(error.response.data).toString('utf8').slice(0, 300)
+              : JSON.stringify(error.response.data).slice(0, 300);
+          } catch (_parseError) { /* keep the original message */ }
+        }
+        lastError = new Error(`ElevenLabs TTS failed (${error.response?.status || 'network'}): ${detail}`);
+        if (attempt < attempts) {
+          this.logger.warn(`${lastError.message} — retrying (${attempt}/${attempts})`);
+          await new Promise(resolve => setTimeout(resolve, 2000 * attempt));
+        }
+      }
+    }
+    throw lastError;
+  }
+
+  /**
+   * Join encoded audio segments without re-encoding them.
+   */
+  async concatAudioFiles(parts, outputPath) {
+    const listPath = `${outputPath}.concat.txt`;
+    const list = parts.map(part => `file '${path.resolve(part).replace(/'/g, "'\\''")}'`).join('\n');
+    await fs.writeFile(listPath, list, 'utf8');
+    try {
+      await runFFmpeg(['-y', '-f', 'concat', '-safe', '0', '-i', listPath, '-c', 'copy', outputPath]);
+    } finally {
+      await fs.unlink(listPath).catch(() => {});
+    }
+    return outputPath;
   }
 
   async generateOpenAITTS(text, outputPath) {
@@ -663,7 +749,14 @@ class AIVideoGenerator {
       }
 
       const videoPath = outputPath.replace('.mp4', '_visual.mp4');
-      const duration = this.calculateScriptDuration(script);
+      // The narration is the source of truth for length. Estimating from word
+      // count produced a 25-second slideshow under a 9-minute voice track, and
+      // the mux then cut the narration off mid-sentence.
+      const narrationSeconds = await getMediaDuration(audioPath);
+      const duration = narrationSeconds && narrationSeconds > 1
+        ? Math.ceil(narrationSeconds)
+        : this.calculateScriptDuration(script);
+      this.logger.info(`Slideshow duration: ${duration}s (${narrationSeconds ? 'measured from narration' : 'estimated from script'})`);
       await this.renderSlidesToVideo(stills, duration, videoPath);
 
       // Add audio
@@ -682,7 +775,12 @@ class AIVideoGenerator {
     }
 
     const fade = 0.5;
-    const perSlide = Math.max(2, totalDuration / stills.length);
+    // Each crossfade overlaps two slides, so the rendered timeline is shorter
+    // than the sum of the slide durations by fade × (n − 1). Dividing the target
+    // duration evenly ignored that and produced a video a few seconds shorter
+    // than the narration — the mux then cut the closing call to action off.
+    const transitions = Math.max(0, stills.length - 1);
+    const perSlide = Math.max(2, (totalDuration + fade * transitions) / stills.length);
 
     const args = ['-y'];
     for (const still of stills) {
@@ -690,7 +788,7 @@ class AIVideoGenerator {
     }
 
     if (stills.length === 1) {
-      args.push('-vf', 'format=yuv420p', '-c:v', 'libx264', videoPath);
+      args.push('-vf', 'format=yuv420p', '-c:v', 'libx264', ...SLIDESHOW_ENCODE, videoPath);
       await runFFmpeg(args);
       return videoPath;
     }
@@ -710,6 +808,7 @@ class AIVideoGenerator {
       '-filter_complex', filters.join(';'),
       '-map', '[vfinal]',
       '-c:v', 'libx264',
+      ...SLIDESHOW_ENCODE,
       '-r', '30',
       videoPath
     );
@@ -931,39 +1030,48 @@ class AIVideoGenerator {
     return '<p>Content coming soon...</p>';
   }
 
+  /**
+   * Estimate spoken duration from the script, used only when no narration file
+   * exists to measure.
+   *
+   * This previously counted `section.content` only when it was a string. The AI
+   * path returns it as an array of sentences, so the entire body of every
+   * AI-written script counted as zero words and the estimate collapsed to its
+   * 30-second floor.
+   */
   calculateScriptDuration(script) {
-    // Estimate duration based on word count (average 150 words per minute)
+    const words = text => (typeof text === 'string' ? text.split(/\s+/).filter(Boolean).length : 0);
     let totalWords = 0;
-    
-    if (script.hook) totalWords += script.hook.text.split(' ').length;
+
+    if (script.hook) totalWords += words(script.hook.text);
     if (script.introduction) {
-      totalWords += (script.introduction.greeting || '').split(' ').length;
-      totalWords += (script.introduction.topicIntro || '').split(' ').length;
+      totalWords += words(script.introduction.greeting);
+      totalWords += words(script.introduction.topicIntro);
+      totalWords += words(script.introduction.valueProposition);
+      totalWords += words(script.introduction.credibility);
     }
-    
-    if (script.mainContent && script.mainContent.sections) {
-      script.mainContent.sections.forEach(section => {
-        if (typeof section.content === 'string') {
-          totalWords += section.content.split(' ').length;
-        }
-        if (section.items) {
-          section.items.forEach(item => {
-            totalWords += (item.title + ' ' + item.description).split(' ').length;
-          });
-        }
-        if (section.steps) {
-          section.steps.forEach(step => {
-            totalWords += (step.title + ' ' + step.description).split(' ').length;
-          });
-        }
-      });
+
+    for (const section of script.mainContent?.sections || []) {
+      totalWords += words(section.title);
+      if (Array.isArray(section.content)) {
+        for (const line of section.content) totalWords += words(line);
+      } else {
+        totalWords += words(section.content);
+      }
+      for (const item of section.items || []) totalWords += words(item.title) + words(item.description);
+      for (const step of section.steps || []) totalWords += words(step.title) + words(step.description) + words(step.tip);
+      for (const point of section.points || []) totalWords += words(point);
     }
-    
+
     if (script.conclusion) {
-      totalWords += script.conclusion.finalThought.split(' ').length;
+      for (const line of script.conclusion.recap || []) totalWords += words(line);
+      totalWords += words(script.conclusion.finalThought);
     }
-    
-    // Convert to duration (150 words per minute)
+
+    const cta = script.callToAction || {};
+    totalWords += words(cta.subscribe) + words(cta.like) + words(cta.comment);
+
+    // 150 words per minute is a typical narration pace.
     return Math.max(30, Math.ceil((totalWords / 150) * 60));
   }
 
