@@ -1,5 +1,6 @@
 const { Logger } = require('../utils/logger');
 const { AITextService } = require('../utils/ai-text-service');
+const { resolveLanguage } = require('../utils/i18n');
 
 class SEOOptimizerAgent {
   constructor(db, credentials) {
@@ -220,96 +221,121 @@ Keep tags under YouTube's 500 character total guidance. Avoid fabricated statist
     }).join(' ');
   }
 
+  /**
+   * Build the public YouTube description.
+   *
+   * Everything here is read by viewers, so it follows the video's language.
+   * The previous version emitted English headings and literal placeholders
+   * ("[Related Video 1]", "[Your Channel URL]") that would have been published
+   * verbatim. Sections with nothing real to say are now omitted entirely rather
+   * than filled with brackets.
+   */
   async generateDescription(script, strategy) {
-    // YouTube description limit: 5000 characters, first 125 shown in search
-    
-    let description = '';
-    
-    // First 125 characters - most important for SEO
-    const hook = `${script.title} - In this video, you'll discover ${strategy.angle.toLowerCase()}.`;
-    description += hook + '\n\n';
-    
-    // Video overview
-    description += '📺 WHAT YOU\'LL LEARN:\n';
-    if (script.mainContent && script.mainContent.sections) {
-      script.mainContent.sections.slice(0, 5).forEach(section => {
-        if (section.title) {
-          description += `• ${section.title}\n`;
-        }
-      });
-    }
-    description += '\n';
-    
-    // Timestamps/Chapters
-    description += '⏱️ TIMESTAMPS:\n';
-    description += '00:00 Introduction\n';
-    let timestamp = 20;
-    if (script.mainContent && script.mainContent.sections) {
-      script.mainContent.sections.forEach(section => {
+    const lang = resolveLanguage(strategy?.language || script?.language);
+    const fr = lang === 'fr';
+    const angle = String(strategy?.angle || strategy?.topic || script?.title || '').trim();
+    const topic = String(strategy?.topic || script?.title || '').trim();
+    const keywords = Array.isArray(strategy?.keywords) ? strategy.keywords.filter(Boolean) : [];
+    const sections = script?.mainContent?.sections || [];
+
+    const blocks = [];
+
+    // The first ~125 characters are what search results show.
+    blocks.push(
+      fr
+        ? `${script.title} — dans cette vidéo : ${angle.toLowerCase()}.`
+        : `${script.title} - In this video, you'll discover ${angle.toLowerCase()}.`
+    );
+
+    if (sections.length) {
+      const heading = fr ? '📺 AU PROGRAMME :' : '📺 WHAT YOU\'LL LEARN:';
+      const items = sections.slice(0, 8).filter(section => section.title).map(section => `• ${section.title}`);
+      if (items.length) blocks.push([heading, ...items].join('\n'));
+
+      const chapters = [fr ? '⏱️ CHAPITRES :' : '⏱️ TIMESTAMPS:', `00:00 ${fr ? 'Introduction' : 'Introduction'}`];
+      let timestamp = 20;
+      for (const section of sections) {
         const minutes = Math.floor(timestamp / 60);
         const seconds = timestamp % 60;
-        description += `${minutes.toString().padStart(2, '0')}:${seconds.toString().padStart(2, '0')} ${section.title || 'Section'}\n`;
+        const title = section.title || (fr ? 'Chapitre' : 'Section');
+        chapters.push(`${String(minutes).padStart(2, '0')}:${String(seconds).padStart(2, '0')} ${title}`);
         timestamp += section.duration || 60;
-      });
+      }
+      blocks.push(chapters.join('\n'));
     }
-    description += '\n';
-    
-    // Keywords paragraph (SEO optimized)
-    description += '📝 ABOUT THIS VIDEO:\n';
-    description += `This comprehensive guide on ${strategy.topic} covers everything you need to know. `;
-    description += `Whether you're a beginner or advanced, you'll find valuable insights about ${strategy.keywords.slice(0, 3).join(', ')}. `;
-    description += `Perfect for ${strategy.targetAudience}.\n\n`;
-    
-    // Links section
-    description += '🔗 USEFUL LINKS:\n';
-    description += `• Subscribe: [Your Channel URL]\n`;
-    description += `• Website: ${process.env.WEBSITE_URL || '[Your Website]'}\n`;
-    description += `• Social Media: ${process.env.SOCIAL_LINKS || '[Your Social Media]'}\n\n`;
-    
-    // Related videos
-    description += '📹 RELATED VIDEOS:\n';
-    description += '• [Related Video 1]\n';
-    description += '• [Related Video 2]\n';
-    description += '• [Related Video 3]\n\n';
-    
-    // Equipment/Tools (if applicable)
-    if (strategy.contentType === 'Tutorial') {
-      description += '🛠️ TOOLS & RESOURCES MENTIONED:\n';
-      description += '• [Tool/Resource 1]\n';
-      description += '• [Tool/Resource 2]\n\n';
+
+    if (topic) {
+      const about = [fr ? '📝 À PROPOS DE CETTE VIDÉO :' : '📝 ABOUT THIS VIDEO:'];
+      about.push(
+        fr
+          ? `Ce guide complet sur ${topic} rassemble l'essentiel à connaître.`
+          : `This comprehensive guide on ${topic} covers everything you need to know.`
+      );
+      if (keywords.length) {
+        about.push(
+          fr
+            ? `Nous y abordons notamment ${keywords.slice(0, 3).join(', ')}.`
+            : `You'll find valuable insights about ${keywords.slice(0, 3).join(', ')}.`
+        );
+      }
+      if (strategy?.targetAudience) {
+        about.push(
+          fr ? `Cette vidéo s'adresse à : ${strategy.targetAudience}.` : `Perfect for ${strategy.targetAudience}.`
+        );
+      }
+      blocks.push(about.join(' '));
     }
-    
-    // Contact/Business
-    description += '📧 BUSINESS INQUIRIES:\n';
-    description += `${process.env.BUSINESS_EMAIL || '[Your Business Email]'}\n\n`;
-    
-    // Tags/Hashtags
-    description += '🏷️ TAGS:\n';
+
+    // Cite the guide the video adapts, so viewers can verify it themselves.
+    const sourceUrl = strategy?.sourceDocument?.url;
+    if (sourceUrl) {
+      blocks.push(
+        [fr ? '🔗 SOURCE :' : '🔗 SOURCE:', `${strategy.sourceDocument.title || sourceUrl}\n${sourceUrl}`].join('\n')
+      );
+    }
+
+    // Only emit link lines that point somewhere real.
+    const links = [];
+    if (process.env.WEBSITE_URL) links.push(`• ${fr ? 'Site' : 'Website'} : ${process.env.WEBSITE_URL}`);
+    if (process.env.SOCIAL_LINKS) links.push(`• ${fr ? 'Réseaux sociaux' : 'Social media'} : ${process.env.SOCIAL_LINKS}`);
+    if (links.length) blocks.push([fr ? '🔗 LIENS UTILES :' : '🔗 USEFUL LINKS:', ...links].join('\n'));
+
+    if (process.env.BUSINESS_EMAIL) {
+      blocks.push([fr ? '📧 CONTACT PROFESSIONNEL :' : '📧 BUSINESS INQUIRIES:', process.env.BUSINESS_EMAIL].join('\n'));
+    }
+
     const hashtags = await this.generateHashtags(strategy);
-    description += hashtags.join(' ') + '\n\n';
-    
-    // Disclaimer if needed
-    description += '⚠️ DISCLAIMER:\n';
-    description += 'This video is for educational purposes only.\n\n';
-    
-    // Copyright
-    description += `© ${new Date().getFullYear()} All Rights Reserved\n`;
-    
-    // Music credits if applicable
-    description += '\n🎵 MUSIC:\n';
-    description += 'Background music from YouTube Audio Library\n';
-    
-    return description;
+    if (hashtags.length) {
+      blocks.push([fr ? '🏷️ TAGS :' : '🏷️ TAGS:', hashtags.join(' ')].join('\n'));
+    }
+
+    blocks.push(
+      [
+        fr ? '⚠️ AVERTISSEMENT :' : '⚠️ DISCLAIMER:',
+        fr
+          ? 'Cette vidéo est fournie à titre informatif et ne constitue pas un conseil personnalisé.'
+          : 'This video is for educational purposes only.',
+      ].join('\n')
+    );
+
+    blocks.push(
+      fr
+        ? `© ${new Date().getFullYear()} Tous droits réservés`
+        : `© ${new Date().getFullYear()} All Rights Reserved`
+    );
+
+    // YouTube hard-limits descriptions at 5000 characters.
+    return blocks.join('\n\n').slice(0, 5000);
   }
 
   async generateTags(script, strategy) {
     const tags = new Set();
     
     // Add primary keywords
-    strategy.keywords.forEach(keyword => tags.add(keyword));
+    (Array.isArray(strategy?.keywords) ? strategy.keywords : []).forEach(keyword => tags.add(keyword));
     
     // Add topic variations
-    const topic = strategy.topic.toLowerCase();
+    const topic = String(strategy?.topic || '').toLowerCase();
     tags.add(topic);
     tags.add(topic.replace(/\s+/g, ''));
     tags.add(topic.replace(/\s+/g, '_'));
@@ -369,7 +395,7 @@ Keep tags under YouTube's 500 character total guidance. Avoid fabricated statist
   }
 
   identifyNiche(strategy) {
-    const topic = strategy.topic.toLowerCase();
+    const topic = String(strategy?.topic || '').toLowerCase();
     
     const niches = {
       'technology': ['tech', 'software', 'hardware', 'gadget', 'computer', 'phone', 'app'],
@@ -434,7 +460,7 @@ Keep tags under YouTube's 500 character total guidance. Avoid fabricated statist
       if (strategy.keywords.includes(tag)) score += 5;
       
       // Contains topic
-      if (tag.includes(strategy.topic.toLowerCase())) score += 3;
+      if (tag.includes(String(strategy?.topic || '').toLowerCase())) score += 3;
       
       // Long-tail keywords
       if (tag.split(' ').length > 2) score += 2;
@@ -459,7 +485,7 @@ Keep tags under YouTube's 500 character total guidance. Avoid fabricated statist
     hashtags.push(primaryHashtag);
     
     // Content type hashtag
-    hashtags.push(`#${strategy.contentType.toLowerCase()}`);
+    if (strategy?.contentType) hashtags.push(`#${String(strategy.contentType).toLowerCase()}`);
     
     // Trending hashtags
     const trendingHashtags = [

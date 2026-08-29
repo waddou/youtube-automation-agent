@@ -69,7 +69,9 @@ class SystemTest {
       { name: 'Stage Arbiter Verdicts', test: () => this.testStageArbiterVerdicts() },
       { name: 'Stage Arbiter Retry Loop', test: () => this.testStageArbiterRetryLoop() },
       { name: 'Narration Excludes Structural Labels', test: () => this.testNarrationHasNoStructuralLabels() },
-      { name: 'Visual Briefs Track Script Content', test: () => this.testVisualBriefsTrackContent() }
+      { name: 'Visual Briefs Track Script Content', test: () => this.testVisualBriefsTrackContent() },
+      { name: 'Null Strategy Context Handling', test: () => this.testNullStrategyContextHandling() },
+      { name: 'Localized YouTube Description', test: () => this.testLocalizedDescription() }
     ];
 
     let passed = 0;
@@ -3612,6 +3614,94 @@ class SystemTest {
     if (matched.get(2) !== '/tmp/section_00.png') {
       throw new Error('Section screenshot was not matched to its narrated section');
     }
+  }
+
+  /**
+   * Regression: the API sets strategyContext to null when a caller omits it,
+   * and a destructuring default does not fire on null — every generation
+   * without an explicit context died on "Cannot read properties of null
+   * (reading 'angle')" before reaching the script stage.
+   */
+  async testNullStrategyContextHandling() {
+    // Exercise the real request validator rather than a hand-made object, so
+    // the test breaks if the validator stops emitting null.
+    const { YouTubeAutomationAgent } = require('./index');
+    const agent = Object.create(YouTubeAutomationAgent.prototype);
+    const result = agent.validateGenerateRequestBody({ topic: 'Accéder à mon espace assurance' });
+    if (!result.valid) throw new Error(`Validator rejected a minimal request: ${result.error}`);
+    if (result.value.strategyContext !== null) {
+      throw new Error('This regression test assumes the validator emits a null strategyContext');
+    }
+
+    // Reproduce the exact normalisation generateContent performs.
+    const options = { jobId: null, strategyContext: result.value.strategyContext, sourceUrl: null };
+    const strategyContext = options.strategyContext || {};
+    if (strategyContext === null || typeof strategyContext !== 'object') {
+      throw new Error('strategyContext was not normalised to an object');
+    }
+    // The access that used to throw.
+    const angle = strategyContext.angle || 'fallback angle';
+    if (angle !== 'fallback angle') throw new Error('Unexpected angle resolution');
+
+    // A pasted URL in the topic field must be picked up as the source guide.
+    const withUrl = agent.validateGenerateRequestBody({
+      topic: 'Guide https://example.test/mon-guide à adapter',
+    });
+    if (withUrl.value.sourceUrl !== 'https://example.test/mon-guide') {
+      throw new Error(`Pasted URL was not detected: ${withUrl.value.sourceUrl}`);
+    }
+
+    // An invalid explicit URL must be rejected rather than fetched blindly.
+    const bad = agent.validateGenerateRequestBody({ topic: 'x', sourceUrl: 'not-a-url' });
+    if (bad.valid) throw new Error('An invalid sourceUrl was accepted');
+  }
+
+  /**
+   * The public description follows the video's language and must never publish
+   * bracketed placeholders.
+   */
+  async testLocalizedDescription() {
+    const { SEOOptimizerAgent } = require('./agents/seo-optimizer-agent');
+    const agent = Object.create(SEOOptimizerAgent.prototype);
+    agent.generateHashtags = async () => ['#assurance', '#banque'];
+
+    const script = {
+      title: 'BPCE Assurances : mon espace',
+      mainContent: {
+        sections: [
+          { title: 'Trouver le bon espace pour mes contrats', duration: 90 },
+          { title: 'Déclarer un sinistre', duration: 120 },
+        ],
+      },
+    };
+    const strategy = {
+      language: 'fr',
+      topic: 'espace client BPCE Assurances',
+      angle: 'Où consulter ses contrats quand aucun portail assureur n\'existe',
+      targetAudience: 'clients Banque Populaire et Caisse d\'Épargne',
+      keywords: ['espace client', 'assurance', 'sinistre'],
+      sourceDocument: { url: 'https://example.test/guide', title: 'Mon guide' },
+    };
+
+    const description = await agent.generateDescription(script, strategy);
+
+    if (/\[(Your|Related|Tool)/.test(description)) {
+      throw new Error('Placeholder brackets would have been published to YouTube');
+    }
+    if (/WHAT YOU'LL LEARN|TIMESTAMPS:|ABOUT THIS VIDEO|All Rights Reserved/.test(description)) {
+      throw new Error('English headings leaked into a French description');
+    }
+    if (!description.includes('AU PROGRAMME') || !description.includes('CHAPITRES')) {
+      throw new Error('French headings are missing from the description');
+    }
+    if (!description.includes('https://example.test/guide')) {
+      throw new Error('The source guide was not cited in the description');
+    }
+    if (description.length > 5000) throw new Error('Description exceeds the YouTube limit');
+
+    // A strategy missing optional fields must not throw.
+    const minimal = await agent.generateDescription({ title: 'Titre' }, { language: 'fr', topic: 'sujet' });
+    if (!minimal.includes('Titre')) throw new Error('Minimal description generation failed');
   }
 }
 

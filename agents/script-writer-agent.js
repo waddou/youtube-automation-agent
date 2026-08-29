@@ -66,7 +66,7 @@ class ScriptWriterAgent {
       // a script be French and another English within a single video.
       this.language = resolveLanguage(strategy.language);
 
-      const template = this.templates[strategy.contentType.toLowerCase()] || this.templates.explainer;
+      const template = this.templates[String(strategy?.contentType || '').toLowerCase()] || this.templates.explainer;
       const aiScript = await this.generateScriptWithAI(strategy, template, options);
       if (aiScript) {
         aiScript.fullScript = this.formatFullScript(aiScript);

@@ -1435,7 +1435,11 @@ class YouTubeAutomationAgent {
 
   async generateContent(topic = null, style = null, length = 'medium', options = {}) {
     this.logger.info('Starting content generation pipeline...');
-    const { jobId = null, strategyContext = {}, sourceUrl = null } = options;
+    const { jobId = null, sourceUrl = null } = options;
+    // Destructuring defaults only fire on `undefined`, never on `null`, and the
+    // request validator sets strategyContext to null when the caller omits it —
+    // so a plain default here still crashed on the first property access.
+    const strategyContext = options.strategyContext || {};
     const profile = await this.db.getChannelProfile() || {};
     const lengthLabels = { short: '2-4 minutes', medium: '8-12 minutes', long: '15-20 minutes' };
     const language = resolveLanguage(profile.language || process.env.DEFAULT_LANGUAGE);
