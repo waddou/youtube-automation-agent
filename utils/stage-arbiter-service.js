@@ -439,11 +439,19 @@ class StageArbiterService {
     }
 
     const audio = assets.audio || {};
+    const hasNarration = Boolean(audio.path) && audio.simulated !== true && audio.status !== 'unavailable';
     checks.push(
-      this.check('production_narration', Boolean(audio.path) && audio.simulated !== true && audio.status !== 'unavailable',
+      this.check('production_narration', hasNarration,
         'Narration audio is missing or simulated', {
-          blocking: false,
-          guidance: 'Configure a live TTS provider so the video carries real narration.',
+          // Without narration *and* without a rendered video there is nothing
+          // publishable, so the stage must fail loudly. Letting it "pass" is
+          // what allowed placeholder-only runs to look successful.
+          blocking: !hasRenderedVideo,
+          // Re-running rarely helps: the usual causes are an unconfigured or
+          // exhausted TTS provider, which needs an operator, not another attempt.
+          recoverable: false,
+          guidance: 'Configure a working TTS provider so the video carries real narration.',
+          evidence: audio.error ? { error: String(audio.error).slice(0, 300) } : null,
         })
     );
 

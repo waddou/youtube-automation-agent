@@ -66,7 +66,11 @@ class Logger {
     } else {
       this.winston.error(message, ...args);
     }
-    console.log(this.formatConsoleMessage('ERROR', message, chalk.red));
+    // Always show the reason on the console line itself. Previously the detail
+    // lived only in the stack, which is suppressed in production — so failures
+    // surfaced as a bare "TTS generation failed:" with nothing to act on.
+    const reason = error && error.message ? ` ${error.message}` : '';
+    console.log(this.formatConsoleMessage('ERROR', `${message}${reason}`, chalk.red));
     if (error && process.env.NODE_ENV !== 'production') {
       console.error(chalk.red(error.stack));
     }

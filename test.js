@@ -71,7 +71,9 @@ class SystemTest {
       { name: 'Narration Excludes Structural Labels', test: () => this.testNarrationHasNoStructuralLabels() },
       { name: 'Visual Briefs Track Script Content', test: () => this.testVisualBriefsTrackContent() },
       { name: 'Null Strategy Context Handling', test: () => this.testNullStrategyContextHandling() },
-      { name: 'Localized YouTube Description', test: () => this.testLocalizedDescription() }
+      { name: 'Localized YouTube Description', test: () => this.testLocalizedDescription() },
+      { name: 'Narration Chunking For TTS', test: () => this.testNarrationChunking() },
+      { name: 'No Fabricated Credibility Claims', test: () => this.testNoFabricatedCredibility() }
     ];
 
     let passed = 0;
@@ -3702,6 +3704,84 @@ class SystemTest {
     // A strategy missing optional fields must not throw.
     const minimal = await agent.generateDescription({ title: 'Titre' }, { language: 'fr', topic: 'sujet' });
     if (!minimal.includes('Titre')) throw new Error('Minimal description generation failed');
+  }
+
+  /**
+   * A full script sent to TTS as one request took minutes and failed often
+   * enough to leave long videos with no narration at all — and an
+   * unassemblable video. Chunks must respect sentence boundaries so no word is
+   * clipped, and must not drop content.
+   */
+  async testNarrationChunking() {
+    const { AIVideoGenerator } = require('./utils/ai-video-generator');
+    const generator = Object.create(AIVideoGenerator.prototype);
+
+    const sentences = [];
+    for (let i = 1; i <= 60; i += 1) {
+      sentences.push(`Voici la phrase numéro ${i} de cette narration de démonstration en français.`);
+    }
+    const narration = sentences.join(' ');
+
+    const chunks = generator.splitNarrationForTTS(narration, 800);
+    if (chunks.length < 4) throw new Error(`Long narration was not split: ${chunks.length} chunk(s)`);
+    if (chunks.some(chunk => chunk.length > 800)) {
+      throw new Error('A chunk exceeded the requested size limit');
+    }
+    // Every chunk must end on a sentence boundary: a mid-sentence cut is audible.
+    if (chunks.some(chunk => !/[.!?]$/.test(chunk.trim()))) {
+      throw new Error('A chunk was cut mid-sentence');
+    }
+    // No content may be lost in the split.
+    const rejoined = chunks.join(' ').replace(/\s+/g, ' ').trim();
+    if (rejoined !== narration.replace(/\s+/g, ' ').trim()) {
+      throw new Error('Chunking dropped or altered narration content');
+    }
+
+    // Short narration stays a single request.
+    const short = generator.splitNarrationForTTS('Une phrase courte et unique.', 800);
+    if (short.length !== 1) throw new Error('Short narration was needlessly split');
+  }
+
+  /**
+   * The intro used to assert credentials the channel had not earned
+   * ("Après avoir accompagné des centaines de personnes"). Credibility must be
+   * a verifiable citation or nothing at all.
+   */
+  async testNoFabricatedCredibility() {
+    const { ScriptWriterAgent } = require('./agents/script-writer-agent');
+    const writer = Object.create(ScriptWriterAgent.prototype);
+
+    const cited = writer.getCredibilityStatement(
+      { sourceDocument: { title: 'Mon guide', url: 'https://compteparticulier.com/guide' } },
+      'fr'
+    );
+    if (!cited.includes('compteparticulier.com')) {
+      throw new Error('A sourced run must cite its source as credibility');
+    }
+
+    // Without a source there is nothing truthful to claim.
+    const unsourced = writer.getCredibilityStatement({}, 'fr');
+    if (unsourced !== '') {
+      throw new Error(`Unsourced credibility must stay empty, got: "${unsourced}"`);
+    }
+
+    const fabricated = /centaines de personnes|passé des mois|spent months|helping hundreds/i;
+    if (fabricated.test(cited) || fabricated.test(unsourced)) {
+      throw new Error('Fabricated credibility resurfaced');
+    }
+
+    // Numbered outline prefixes must not survive into spoken section titles.
+    for (const [raw, expected] of [
+      ['1. Trouver le bon espace', 'Trouver le bon espace'],
+      ['2) Déclarer un sinistre', 'Déclarer un sinistre'],
+      ['• Point clé', 'Point clé'],
+      ['Titre normal 2026', 'Titre normal 2026'],
+    ]) {
+      const cleaned = writer.cleanSectionTitle(raw);
+      if (cleaned !== expected) {
+        throw new Error(`cleanSectionTitle("${raw}") returned "${cleaned}", expected "${expected}"`);
+      }
+    }
   }
 }
 

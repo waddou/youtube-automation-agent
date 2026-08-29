@@ -159,36 +159,148 @@ class AIVideoGenerator {
     return outputPath;
   }
 
+  /**
+   * Narrate a full script with Gemini TTS.
+   *
+   * A whole 8-12 minute script sent as one request takes minutes and fails
+   * often enough to block every long video — the run that motivated this
+   * spent 4m34s before erroring out, leaving the pipeline with no narration
+   * and therefore no assemblable video. Splitting on sentence boundaries keeps
+   * each request small and lets a single failed chunk be retried on its own
+   * instead of discarding the entire narration.
+   */
   async generateGeminiTTS(text, outputPath) {
-    const model = process.env.GEMINI_TTS_MODEL || 'gemini-3.1-flash-tts-preview';
-    const voiceName = process.env.GEMINI_TTS_VOICE || 'Kore';
+    const chunks = this.splitNarrationForTTS(text);
 
-    const response = await this.gemini.models.generateContent({
-      model,
-      contents: [{ parts: [{ text }] }],
-      config: {
-        responseModalities: ['AUDIO'],
-        speechConfig: {
-          voiceConfig: {
-            prebuiltVoiceConfig: { voiceName }
-          }
-        }
-      }
-    });
-
-    const audioData = response.candidates?.[0]?.content?.parts?.[0]?.inlineData?.data;
-    if (!audioData) {
-      throw new Error('Gemini TTS returned no audio data');
+    if (chunks.length === 1) {
+      await this.synthesizeGeminiChunk(chunks[0], outputPath);
+      this.logger.info('Gemini TTS generation complete');
+      return outputPath;
     }
 
-    // Gemini returns raw PCM (24kHz, mono, 16-bit); encode to the requested container via FFmpeg
-    const pcmPath = outputPath + '.pcm';
-    await fs.writeFile(pcmPath, Buffer.from(audioData, 'base64'));
-    await runFFmpeg(['-y', '-f', 's16le', '-ar', '24000', '-ac', '1', '-i', pcmPath, outputPath]);
-    await fs.unlink(pcmPath).catch(() => {});
+    this.logger.info(`Narrating ${chunks.length} segments with Gemini TTS...`);
+    const pcmParts = [];
+
+    // Completed segments are kept on disk between runs. Synthesis is billed per
+    // request, and a failure late in a long narration — a quota running out, a
+    // transient 5xx — used to discard every segment already paid for. On a
+    // retry, cached segments are reused and only the missing ones are bought.
+    for (const [index, chunk] of chunks.entries()) {
+      const partPath = `${outputPath}.part${String(index).padStart(2, '0')}.pcm`;
+      if (await this.hasUsablePcm(partPath)) {
+        this.logger.info(`  segment ${index + 1}/${chunks.length} reused from cache`);
+        pcmParts.push(partPath);
+        continue;
+      }
+      try {
+        await this.synthesizeGeminiChunk(chunk, partPath, { rawPcm: true });
+      } catch (error) {
+        this.logger.warn(
+          `Narration stopped at segment ${index + 1}/${chunks.length}; ` +
+          `${pcmParts.length} completed segment(s) kept for the next attempt`
+        );
+        throw error;
+      }
+      pcmParts.push(partPath);
+      this.logger.info(`  segment ${index + 1}/${chunks.length} done`);
+    }
+
+    // Raw PCM of identical format concatenates by simple byte append, which
+    // avoids a lossy re-encode per segment and any inter-segment gap.
+    const joinedPath = `${outputPath}.joined.pcm`;
+    await fs.writeFile(joinedPath, Buffer.concat(await Promise.all(pcmParts.map(part => fs.readFile(part)))));
+    await runFFmpeg(['-y', '-f', 's16le', '-ar', '24000', '-ac', '1', '-i', joinedPath, outputPath]);
+    await fs.unlink(joinedPath).catch(() => {});
+    // Only discard the cache once the finished file exists.
+    await Promise.all(pcmParts.map(part => fs.unlink(part).catch(() => {})));
 
     this.logger.info('Gemini TTS generation complete');
     return outputPath;
+  }
+
+  async hasUsablePcm(filePath) {
+    try {
+      const stats = await fs.stat(filePath);
+      // A truncated write leaves a tiny file; anything under a second of 24kHz
+      // 16-bit mono audio is not a real segment.
+      return stats.size > 48000;
+    } catch (_error) {
+      return false;
+    }
+  }
+
+  async synthesizeGeminiChunk(text, outputPath, options = {}) {
+    const model = process.env.GEMINI_TTS_MODEL || 'gemini-3.1-flash-tts-preview';
+    const voiceName = process.env.GEMINI_TTS_VOICE || 'Kore';
+    const attempts = Math.max(1, Number(process.env.GEMINI_TTS_RETRIES || 2));
+
+    let lastError = null;
+    for (let attempt = 1; attempt <= attempts; attempt += 1) {
+      try {
+        const response = await this.gemini.models.generateContent({
+          model,
+          contents: [{ parts: [{ text }] }],
+          config: {
+            responseModalities: ['AUDIO'],
+            speechConfig: {
+              voiceConfig: {
+                prebuiltVoiceConfig: { voiceName }
+              }
+            }
+          }
+        });
+
+        const audioData = response.candidates?.[0]?.content?.parts?.[0]?.inlineData?.data;
+        if (!audioData) throw new Error('Gemini TTS returned no audio data');
+
+        const pcm = Buffer.from(audioData, 'base64');
+        if (options.rawPcm) {
+          // Gemini returns raw PCM (24kHz, mono, 16-bit); keep it unencoded so
+          // segments can be joined losslessly.
+          await fs.writeFile(outputPath, pcm);
+          return outputPath;
+        }
+
+        const pcmPath = outputPath + '.pcm';
+        await fs.writeFile(pcmPath, pcm);
+        await runFFmpeg(['-y', '-f', 's16le', '-ar', '24000', '-ac', '1', '-i', pcmPath, outputPath]);
+        await fs.unlink(pcmPath).catch(() => {});
+        return outputPath;
+      } catch (error) {
+        lastError = error;
+        if (attempt < attempts) {
+          this.logger.warn(`Gemini TTS segment failed (attempt ${attempt}/${attempts}): ${error.message}`);
+          await new Promise(resolve => setTimeout(resolve, 2000 * attempt));
+        }
+      }
+    }
+    throw lastError;
+  }
+
+  /**
+   * Split narration into TTS-sized pieces without cutting mid-sentence, since a
+   * cut inside a sentence is audible as a dropped word.
+   */
+  splitNarrationForTTS(text, maxChars = Number(process.env.TTS_CHUNK_CHARS || 1800)) {
+    const source = String(text || '').trim();
+    if (source.length <= maxChars) return [source];
+
+    // Split on sentence enders and blank lines, keeping the punctuation.
+    const units = source.split(/(?<=[.!?])\s+|\n{2,}/).map(unit => unit.trim()).filter(Boolean);
+    const chunks = [];
+    let current = '';
+
+    for (const unit of units) {
+      if (current && `${current} ${unit}`.length > maxChars) {
+        chunks.push(current);
+        current = unit;
+      } else {
+        current = current ? `${current} ${unit}` : unit;
+      }
+    }
+    if (current) chunks.push(current);
+
+    return chunks.length ? chunks : [source];
   }
 
   /**

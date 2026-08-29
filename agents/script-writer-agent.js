@@ -133,6 +133,10 @@ class ScriptWriterAgent {
       `{
   "title": "compelling title under 100 characters",
   "hook": "opening hook in one sentence",
+  "introduction": {
+    "topicIntro": "one sentence naming what this video is about",
+    "valueProposition": "one sentence on what the viewer will be able to do afterwards"
+  },
   "sections": [
     { "title": "section title", "content": ["spoken script sentence"], "duration": 60 }
   ],
@@ -165,6 +169,7 @@ class ScriptWriterAgent {
       'Avoid fabricated statistics, unsupported claims, and fake urgency. List every externally verifiable factual claim in claims.',
       'Use only exact URLs from Research sources; use an empty sourceUrls array when the supplied sources do not support a claim.',
       'Never restate the introduction inside a later section: each section must add information the viewer did not already hear.',
+      'The introduction announces what is coming; the first section must then start delivering it, not repeat the announcement.',
       options.arbiterFeedback ? `\n${options.arbiterFeedback}` : '',
     ]
       .filter(Boolean)
@@ -187,7 +192,7 @@ class ScriptWriterAgent {
         title: String(parsed.title).slice(0, 100),
         hook: this.normalizeAIHook(parsed.hook),
         language,
-        introduction: await this.generateIntroduction(strategy),
+        introduction: await this.buildIntroduction(strategy, parsed.introduction),
         mainContent: {
           sections,
           totalDuration: this.calculateSectionsDuration(sections)
@@ -299,14 +304,29 @@ class ScriptWriterAgent {
           .filter(Boolean);
 
         const language = resolveLanguage(strategy.language);
+        const rawTitle = String(section.title || `${strategy.topic} — ${label(language, 'section')} ${index + 1}`).trim();
         return {
           type: 'ai_generated',
-          title: String(section.title || `${strategy.topic} — ${label(language, 'section')} ${index + 1}`).trim(),
+          title: this.cleanSectionTitle(rawTitle),
           content,
           duration: parseInt(section.duration, 10) || 60
         };
       })
       .filter(section => section.title && section.content.length > 0);
+  }
+
+  /**
+   * Strip list numbering the model copies from the source outline.
+   *
+   * Section titles are spoken aloud, and "1. Trouver le bon espace" is read as
+   * "un, trouver le bon espace" — an artefact of the written outline leaking
+   * into speech.
+   */
+  cleanSectionTitle(title) {
+    return String(title)
+      .replace(/^\s*(?:\d{1,2}|[ivxlIVXL]{1,4})\s*[).:\-–—]\s*/, '')
+      .replace(/^\s*[-•–—]\s*/, '')
+      .trim();
   }
 
   normalizeAIClaims(claims, sources) {
@@ -510,17 +530,70 @@ class ScriptWriterAgent {
     return stats[Math.floor(Math.random() * stats.length)];
   }
 
+  /**
+   * Prefer the model's own introduction over the generic template.
+   *
+   * The template phrasing ("Aujourd'hui, nous allons voir en détail <topic>")
+   * restates the title and then the first section restates it again — the
+   * looping-introduction effect viewers noticed. An introduction written
+   * alongside the sections knows what follows it and can hand over instead of
+   * duplicating.
+   */
+  async buildIntroduction(strategy, aiIntroduction) {
+    const template = await this.generateIntroduction(strategy);
+    if (!aiIntroduction || typeof aiIntroduction !== 'object') return template;
+
+    const topicIntro = String(aiIntroduction.topicIntro || '').trim();
+    const valueProposition = String(aiIntroduction.valueProposition || '').trim();
+
+    return {
+      ...template,
+      topicIntro: topicIntro || template.topicIntro,
+      valueProposition: valueProposition || template.valueProposition,
+    };
+  }
+
   async generateIntroduction(strategy) {
     const language = resolveLanguage(this.language);
     const isFrench = language === 'fr';
-    
+
     return {
-      greeting: isFrench ? "Bonjour à tous, bienvenue sur la chaîne !" : "Hey everyone, welcome back to the channel!",
+      greeting: isFrench ? 'Bonjour à tous, bienvenue sur la chaîne !' : 'Hey everyone, welcome back to the channel!',
       topicIntro: isFrench ? `Aujourd'hui, nous allons voir en détail ${strategy.topic}.` : `Today, we're diving deep into ${strategy.topic}.`,
       valueProposition: isFrench ? `À la fin de cette vidéo, vous comprendrez exactement ${this.getValuePropositionFR(strategy)}.` : `By the end of this video, you'll understand exactly ${this.getValueProposition(strategy)}.`,
-      credibility: this.getCredibilityStatementFR(strategy),
+      credibility: this.getCredibilityStatement(strategy, language),
       duration: '0:05-0:20'
     };
+  }
+
+  /**
+   * State where the information comes from — or say nothing.
+   *
+   * The previous helpers picked at random from claims the channel had not
+   * earned ("I've spent months researching this topic", "Après avoir accompagné
+   * des centaines de personnes"). Those are fabricated credentials asserted to
+   * the viewer, which the pipeline's own factual-safety rules forbid. A
+   * verifiable citation is the only honest form of credibility available here.
+   */
+  getCredibilityStatement(strategy, language) {
+    const source = strategy?.sourceDocument;
+    if (!source?.title) return '';
+
+    let publisher = null;
+    try {
+      publisher = new URL(source.url).hostname.replace(/^www\./, '');
+    } catch (_error) {
+      publisher = null;
+    }
+
+    if (resolveLanguage(language) === 'fr') {
+      return publisher
+        ? `Ce guide reprend les informations publiées sur ${publisher}.`
+        : `Ce guide reprend les informations du document « ${source.title} ».`;
+    }
+    return publisher
+      ? `This guide follows the information published on ${publisher}.`
+      : `This guide follows the document "${source.title}".`;
   }
 
   getValueProposition(strategy) {
@@ -547,29 +620,7 @@ class ScriptWriterAgent {
     return propositions[strategy.contentType] || `tout sur ${strategy.topic}`;
   }
 
-  getCredibilityStatement(_strategy) {
-    const statements = [
-      "I've spent months researching this topic",
-      "After working with hundreds of people on this",
-      "Based on the latest research and data",
-      "Drawing from real-world experience",
-      "Using proven methods and strategies"
-    ];
-    
-    return statements[Math.floor(Math.random() * statements.length)];
-  }
 
-  getCredibilityStatementFR(_strategy) {
-    const statements = [
-      "J'ai passé des mois à rechercher ce sujet",
-      "Après avoir accompagné des centaines de personnes sur ce thème",
-      "Basé sur les dernières recherches et données",
-      "Fort d'une expérience terrain",
-      "En utilisant des méthodes éprouvées"
-    ];
-    
-    return statements[Math.floor(Math.random() * statements.length)];
-  }
 
   async generateMainContent(strategy, template) {
     const sections = [];

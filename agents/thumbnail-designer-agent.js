@@ -224,11 +224,16 @@ class ThumbnailDesignerAgent {
       </svg>
     `;
     
+    // Create the destination alongside the write rather than relying on
+    // initialize() having run: a missing uploads/thumbnails directory otherwise
+    // fails the whole generation on a fresh checkout.
+    await fs.mkdir(path.dirname(outputPath), { recursive: true });
+
     await sharp(Buffer.from(svg))
       .resize(width, height)
       .png()
       .toFile(outputPath);
-    
+
     return outputPath;
   }
 
